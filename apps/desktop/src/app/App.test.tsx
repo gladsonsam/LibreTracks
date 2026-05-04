@@ -239,6 +239,12 @@ function getExternalDropGuide(container: HTMLElement) {
   ) ?? null;
 }
 
+function getLibraryAssetRow(container: HTMLElement, fileName: string) {
+  return Array.from(container.querySelectorAll(".lt-library-asset")).find(
+    (element): element is HTMLElement => element instanceof HTMLElement && element.getAttribute("title") === fileName,
+  ) ?? null;
+}
+
 function createFileList(files: File[]) {
   return {
     length: files.length,
@@ -285,6 +291,14 @@ async function renderApp() {
     ).toBeTruthy();
   });
   return view;
+}
+
+async function openLibraryPanel() {
+  const libraryButton = screen.getByRole("button", { name: textMatcher(en.transport.shell.library) });
+  await act(async () => {
+    fireEvent.click(libraryButton);
+  });
+  await screen.findByLabelText(textMatcher(en.library.panelAria));
 }
 
 function mockRulerBounds(container: HTMLElement) {
@@ -650,13 +664,10 @@ describe("App", () => {
   it("drops a library asset onto a track lane and creates a new clip without dataTransfer", async () => {
     disablePointerEventSupport();
     const { container } = await renderApp();
+    await openLibraryPanel();
     mockRulerBounds(container);
     mockLaneBounds(container);
     mockTrackListBounds(container);
-
-    await act(async () => {
-      fireEvent.click(screen.getByRole("button", { name: /library/i }));
-    });
 
     const drumsRow = getTrackLaneRow(container, "Drums");
     expect(drumsRow).toBeTruthy();
@@ -845,6 +856,7 @@ describe("App", () => {
   });
 
   it("drops a song package on the timeline", async () => {
+    const desktopApi = await import("../features/transport/desktopApi");
     const { container } = await renderApp();
     mockRulerBounds(container);
     mockLaneBounds(container);
@@ -864,6 +876,11 @@ describe("App", () => {
     });
 
     expect(await screen.findByText(/package imported at/i)).toBeTruthy();
+    await waitFor(async () => {
+      expect(await desktopApi.getLibraryAssets()).toEqual(
+        expect.arrayContaining([expect.objectContaining({ fileName: "session-package.wav" })]),
+      );
+    });
   });
 
   it("drops audio files on the timeline, imports them, and creates one new track per file", async () => {
@@ -878,6 +895,7 @@ describe("App", () => {
       return testDesktopApiMock.importAudioFilesFromBytes(files);
     });
     const { container } = await renderApp();
+    await openLibraryPanel();
     mockRulerBounds(container);
     mockLaneBounds(container);
     mockTrackListBounds(container);
@@ -896,8 +914,8 @@ describe("App", () => {
       fireEvent.drop(timelinePane as HTMLElement, { dataTransfer, clientX: 420, clientY: 180 });
     });
 
-    expect(screen.getByText("lead.wav")).toBeTruthy();
-    expect(screen.getByText("pad.mp3")).toBeTruthy();
+    expect(screen.getAllByText("lead.wav").length).toBeGreaterThan(0);
+    expect(screen.getAllByText("pad.mp3").length).toBeGreaterThan(0);
     expect(screen.getByText(/Importing 2 audio files/i)).toBeTruthy();
     expect(useTransportStore.getState().pendingAudioImports).toHaveLength(2);
 
@@ -911,9 +929,9 @@ describe("App", () => {
     expect(screen.getByText("Lead")).toBeTruthy();
     expect(screen.getByText("Pad")).toBeTruthy();
     await waitFor(() => {
-      expect(screen.queryByText("lead.wav")).toBeNull();
-      expect(screen.queryByText("pad.mp3")).toBeNull();
       expect(useTransportStore.getState().pendingAudioImports).toHaveLength(0);
+      expect(getLibraryAssetRow(container, "lead.wav")).toBeTruthy();
+      expect(getLibraryAssetRow(container, "pad.mp3")).toBeTruthy();
     });
 
     await waitFor(() => {
@@ -949,6 +967,7 @@ describe("App", () => {
     });
 
     const { container } = await renderApp();
+    await openLibraryPanel();
     mockRulerBounds(container);
     mockLaneBounds(container);
     mockTrackListBounds(container);
@@ -977,8 +996,8 @@ describe("App", () => {
       });
     });
 
-    expect(screen.getByText("lead.wav")).toBeTruthy();
-    expect(screen.getByText("pad.mp3")).toBeTruthy();
+    expect(screen.getAllByText("lead.wav").length).toBeGreaterThan(0);
+    expect(screen.getAllByText("pad.mp3").length).toBeGreaterThan(0);
     expect(useTransportStore.getState().pendingAudioImports).toHaveLength(2);
 
     await waitFor(() => {
@@ -997,8 +1016,14 @@ describe("App", () => {
 
     expect(await screen.findByText(textMatcher(interpolate(en.transport.status.clipsAdded, { count: 2 })))).toBeTruthy();
     expect(importAudioFilesFromBytesMock).not.toHaveBeenCalled();
-    await waitFor(() => {
+    await waitFor(async () => {
       expect(useTransportStore.getState().pendingAudioImports).toHaveLength(0);
+      expect(await desktopApi.getLibraryAssets()).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({ fileName: "lead.wav" }),
+          expect.objectContaining({ fileName: "pad.mp3" }),
+        ]),
+      );
     });
   });
 

@@ -71,6 +71,21 @@ function sortLibraryAssets(assets: LibraryAssetSummary[]) {
   });
 }
 
+function addImportedPackageAsset() {
+  const asset = {
+    fileName: "session-package.wav",
+    filePath: "audio/session-package.wav",
+    durationSeconds: 32,
+    isMissing: false,
+    folderPath: null,
+  } satisfies LibraryAssetSummary;
+
+  if (!state.libraryAssets.some((existing) => existing.filePath === asset.filePath)) {
+    state.libraryAssets.push(asset);
+    state.libraryAssets = sortLibraryAssets(state.libraryAssets);
+  }
+}
+
 function buildWaveformSummary(waveformKey: string, durationSeconds: number): WaveformSummaryDto {
   const bucketCount = 96;
   const minPeaks: number[] = [];
@@ -781,15 +796,30 @@ export const testDesktopApiMock = {
     return clone(importedAssets);
   },
   exportRegionAsPackage: async (_regionId: string) => {},
-  importSongPackage: async (_packagePath: string, _insertAtSeconds: number) => clone(buildSnapshot()),
-  importSongPackageFromBytes: async (_packageBytes: Uint8Array | number[], _insertAtSeconds: number) => {
+  importSongPackage: async (_packagePath: string, _insertAtSeconds: number) => {
+    addImportedPackageAsset();
     replaceSong({
       ...state.song,
       projectRevision: state.projectRevision + 1,
     });
     return clone(buildSnapshot());
   },
-  importSongPackageFromBase64: async (_packageBase64: string, _insertAtSeconds: number) => clone(buildSnapshot()),
+  importSongPackageFromBytes: async (_packageBytes: Uint8Array | number[], _insertAtSeconds: number) => {
+    addImportedPackageAsset();
+    replaceSong({
+      ...state.song,
+      projectRevision: state.projectRevision + 1,
+    });
+    return clone(buildSnapshot());
+  },
+  importSongPackageFromBase64: async (_packageBase64: string, _insertAtSeconds: number) => {
+    addImportedPackageAsset();
+    replaceSong({
+      ...state.song,
+      projectRevision: state.projectRevision + 1,
+    });
+    return clone(buildSnapshot());
+  },
   resolveMissingFile: async (oldPath: string, newPath: string) => {
     state.libraryAssets = sortLibraryAssets(
       state.libraryAssets.map((asset) =>

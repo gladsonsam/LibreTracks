@@ -1241,7 +1241,8 @@ export function TransportPanelContent() {
   const playbackProjectRevision = useTransportStore((state) => state.playback?.projectRevision ?? 0);
   const playbackSongDir = useTransportStore((state) => state.playback?.songDir ?? null);
   const pendingAudioImports = useTransportStore((state) => state.pendingAudioImports);
-  const projectIdentityRef = useRef<string | null>(null);
+  const projectIdentityRef = useRef<{ songDir: string | null; songId: string | null } | null>(null);
+  const libraryStateRequestIdRef = useRef(0);
   const pendingMarkerJumpSignature = useTransportStore((state) => {
     const pendingJump = state.playback?.pendingMarkerJump;
     if (!pendingJump) {
@@ -1298,10 +1299,36 @@ export function TransportPanelContent() {
   }, [playbackSongDir]);
 
   const refreshLibraryState = useCallback(async () => {
+    const requestId = ++libraryStateRequestIdRef.current;
     const { assets, folders } = await loadLibraryState();
+    if (requestId !== libraryStateRequestIdRef.current) {
+      return;
+    }
+
     setLibraryAssets(assets);
     setLibraryFolders(folders);
   }, [loadLibraryState]);
+
+  const mergeLibraryAssets = useCallback((importedAssets: LibraryAssetSummary[]) => {
+    if (!importedAssets.length) {
+      return;
+    }
+
+    libraryStateRequestIdRef.current += 1;
+
+    setLibraryAssets((current) => {
+      const byFilePath = new Map(current.map((asset) => [asset.filePath, asset]));
+      for (const asset of importedAssets) {
+        byFilePath.set(asset.filePath, asset);
+      }
+
+      return [...byFilePath.values()].sort((left, right) => {
+        const leftFolder = (left.folderPath ?? "").toLowerCase();
+        const rightFolder = (right.folderPath ?? "").toLowerCase();
+        return leftFolder.localeCompare(rightFolder) || left.fileName.localeCompare(right.fileName);
+      });
+    });
+  }, []);
 
   const refreshSongView = useCallback(async () => {
     const nextSong = await getSongView();
@@ -2307,10 +2334,20 @@ export function TransportPanelContent() {
   }, [playbackProjectRevision]);
 
   useEffect(() => {
-    const nextProjectIdentity = playbackSongDir ? `${playbackSongDir}::${song?.id ?? "pending"}` : null;
+    const nextProjectIdentity = {
+      songDir: playbackSongDir,
+      songId: song?.id ?? null,
+    };
     const previousProjectIdentity = projectIdentityRef.current;
 
-    if (previousProjectIdentity !== null && previousProjectIdentity !== nextProjectIdentity) {
+    const shouldResetProjectScopedState =
+      previousProjectIdentity !== null &&
+      (previousProjectIdentity.songDir !== nextProjectIdentity.songDir ||
+        (previousProjectIdentity.songId !== null &&
+          nextProjectIdentity.songId !== null &&
+          previousProjectIdentity.songId !== nextProjectIdentity.songId));
+
+    if (shouldResetProjectScopedState) {
       setWaveformCache({});
       setLibraryAssets([]);
       setLibraryClipPreview([]);
@@ -2326,19 +2363,21 @@ export function TransportPanelContent() {
 
     async function loadLibraryAssets() {
       if (!playbackSongDir) {
+        libraryStateRequestIdRef.current += 1;
         setLibraryAssets([]);
         setLibraryFolders([]);
         setLibraryClipPreview([]);
         return;
       }
 
+      const requestId = ++libraryStateRequestIdRef.current;
       setLibraryAssets([]);
       setLibraryFolders([]);
       setLibraryClipPreview([]);
       setIsLibraryLoading(true);
       try {
         const { assets, folders } = await loadLibraryState();
-        if (!active) {
+        if (!active || requestId !== libraryStateRequestIdRef.current) {
           return;
         }
 
@@ -5700,14 +5739,14 @@ export function TransportPanelContent() {
     const packageBytes = new Uint8Array(await file.arrayBuffer());
     const nextSnapshot = await importSongPackageFromBytes(packageBytes, dropSeconds);
     applyPlaybackSnapshot(nextSnapshot);
-    await refreshLibraryState();
+    await Promise.all([refreshSongView(), refreshLibraryState()]);
     setStatus(t("transport.status.packageImportedAt", { time: formatClock(dropSeconds) }));
   }
 
   async function handleDroppedSongPackagePath(packagePath: string, dropSeconds: number) {
     const nextSnapshot = await importSongPackage(packagePath, dropSeconds);
     applyPlaybackSnapshot(nextSnapshot);
-    await refreshLibraryState();
+    await Promise.all([refreshSongView(), refreshLibraryState()]);
     setStatus(t("transport.status.packageImportedAt", { time: formatClock(dropSeconds) }));
   }
 
@@ -5785,6 +5824,7 @@ export function TransportPanelContent() {
       }
 
       useTransportStore.getState().updatePendingAudioImportStatus(pendingIds, "metadata");
+      mergeLibraryAssets(importedAssets);
       await refreshLibraryState();
 
       useTransportStore.getState().updatePendingAudioImportStatus(pendingIds, "analyzing");
@@ -5847,6 +5887,7 @@ export function TransportPanelContent() {
       );
 
       useTransportStore.getState().updatePendingAudioImportStatus(pendingIds, "metadata");
+      mergeLibraryAssets(importedAssets);
       await refreshLibraryState();
 
       useTransportStore.getState().updatePendingAudioImportStatus(pendingIds, "analyzing");
