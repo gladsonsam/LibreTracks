@@ -978,6 +978,54 @@ describe("App", () => {
     });
   });
 
+  it("uses native file paths for external audio drops when native coordinates are physical pixels", async () => {
+    const desktopApi = await import("../features/transport/desktopApi");
+    const importAudioFilesFromPathsMock = vi.mocked(desktopApi.importAudioFilesFromPaths);
+    const originalDevicePixelRatio = window.devicePixelRatio;
+
+    Object.defineProperty(window, "devicePixelRatio", {
+      configurable: true,
+      value: 2,
+    });
+
+    const { container } = await renderApp();
+    mockRulerBounds(container);
+    mockLaneBounds(container);
+    mockTrackListBounds(container);
+    mockTimelinePaneBounds(container);
+
+    try {
+      await act(async () => {
+        await emitNativeDropEvent({
+          type: "enter",
+          paths: ["C:/mock/imports/lead.wav"],
+          position: { x: 840, y: 360 },
+        });
+      });
+
+      expect(screen.getByText("Audio")).toBeTruthy();
+
+      await act(async () => {
+        await emitNativeDropEvent({
+          type: "drop",
+          paths: ["C:/mock/imports/lead.wav"],
+          position: { x: 840, y: 360 },
+        });
+      });
+
+      await waitFor(() => {
+        expect(importAudioFilesFromPathsMock).toHaveBeenCalledWith([
+          { fileName: "lead.wav", sourcePath: "C:/mock/imports/lead.wav" },
+        ]);
+      });
+    } finally {
+      Object.defineProperty(window, "devicePixelRatio", {
+        configurable: true,
+        value: originalDevicePixelRatio,
+      });
+    }
+  });
+
   it("marks pending external audio imports as failed when the import rejects", async () => {
     const desktopApi = await import("../features/transport/desktopApi");
     vi.mocked(desktopApi.importAudioFilesFromBytes).mockRejectedValueOnce(new Error("Import failed in test"));

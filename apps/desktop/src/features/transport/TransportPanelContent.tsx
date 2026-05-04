@@ -518,6 +518,22 @@ function toClientPointFromNativePosition(position: { x: number; y: number }) {
   };
 }
 
+function nativeClientPointCandidates(position: { x: number; y: number }) {
+  const scaledPoint = toClientPointFromNativePosition(position);
+
+  if (scaledPoint.clientX === position.x && scaledPoint.clientY === position.y) {
+    return [scaledPoint];
+  }
+
+  return [
+    scaledPoint,
+    {
+      clientX: position.x,
+      clientY: position.y,
+    },
+  ];
+}
+
 function formatMusicalPosition(seconds: number, song: SongView | null | undefined) {
   return getCumulativeMusicalPosition(
     seconds,
@@ -5162,8 +5178,18 @@ export function TransportPanelContent() {
   }
 
   function resolveTimelineDropFromNativePosition(position: { x: number; y: number }) {
-    const clientPoint = toClientPointFromNativePosition(position);
-    return resolveTimelineDropFromClientPoint(clientPoint.clientX, clientPoint.clientY);
+    for (const clientPoint of nativeClientPointCandidates(position)) {
+      const hit = resolveTimelineDropFromClientPoint(clientPoint.clientX, clientPoint.clientY);
+      if (hit.isOverTimeline) {
+        return hit;
+      }
+    }
+
+    return {
+      isOverTimeline: false,
+      dropSeconds: 0,
+      targetTrackId: null,
+    };
   }
 
   function resolveLibraryFolderDropFromClientPoint(clientX: number, clientY: number) {
