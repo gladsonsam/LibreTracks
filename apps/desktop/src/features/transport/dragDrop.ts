@@ -53,7 +53,15 @@ export function isExternalFileDrag(dataTransfer: DataTransfer | null) {
 }
 
 export function getDroppedFiles(dataTransfer: DataTransfer | null) {
-  return Array.from(dataTransfer?.files ?? []);
+  const files = Array.from(dataTransfer?.files ?? []);
+  if (files.length > 0) {
+    return files;
+  }
+
+  return Array.from(dataTransfer?.items ?? [])
+    .filter((item) => item.kind === "file")
+    .map((item) => item.getAsFile())
+    .filter((file): file is File => file !== null);
 }
 
 export function classifyDroppedFiles(files: File[]): DroppedFileClassification {

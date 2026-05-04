@@ -8,7 +8,7 @@ import {
   isInternalLibraryDrag,
 } from "./dragDrop";
 
-function buildTransfer(args?: { files?: File[]; types?: string[] }) {
+function buildTransfer(args?: { files?: File[]; items?: DataTransferItem[]; types?: string[] }) {
   const files = args?.files ?? [];
   const fileList = {
     length: files.length,
@@ -18,6 +18,7 @@ function buildTransfer(args?: { files?: File[]; types?: string[] }) {
 
   return {
     files: fileList,
+    items: args?.items ?? [],
     types: args?.types ?? [],
   } as DataTransfer;
 }
@@ -60,5 +61,22 @@ describe("dragDrop helpers", () => {
     const files = [new File([new Uint8Array([1])], "drums.wav")];
     expect(getDroppedFiles(buildTransfer({ files, types: ["Files"] }))).toHaveLength(1);
     expect(isExternalFileDrag(buildTransfer({ files, types: ["Files"] }))).toBe(true);
+  });
+
+  it("falls back to DataTransfer.items during hover classification", () => {
+    const items = [
+      {
+        kind: "file",
+        getAsFile: () => new File([new Uint8Array([1])], "song.ltpkg"),
+      },
+      {
+        kind: "file",
+        getAsFile: () => new File([new Uint8Array([2])], "guide.wav"),
+      },
+    ] as DataTransferItem[];
+
+    const files = getDroppedFiles(buildTransfer({ items, types: ["Files"] }));
+    expect(files).toHaveLength(2);
+    expect(classifyDroppedFiles(files).kind).toBe("mixed");
   });
 });

@@ -486,6 +486,53 @@ export function TimelineCanvasPane({
         onDrop={onTrackListLibraryDrop}
         onDragLeave={onTrackListLibraryDragLeave}
       >
+        {externalDropPreview !== null ? (
+          <div
+            aria-hidden="true"
+            style={{
+              position: "sticky",
+              top: 10,
+              display: "flex",
+              justifyContent: "flex-end",
+              paddingRight: 14,
+              zIndex: 5,
+              pointerEvents: "none",
+            }}
+          >
+            <div
+              style={{
+                padding: "6px 10px",
+                borderRadius: 999,
+                background:
+                  externalDropPreview.kind === "audio"
+                    ? "rgba(122,229,130,0.18)"
+                    : externalDropPreview.kind === "package"
+                      ? "rgba(255,184,107,0.18)"
+                      : "rgba(255,107,107,0.18)",
+                border:
+                  externalDropPreview.kind === "audio"
+                    ? "1px solid rgba(122,229,130,0.34)"
+                    : externalDropPreview.kind === "package"
+                      ? "1px solid rgba(255,184,107,0.34)"
+                      : "1px solid rgba(255,107,107,0.34)",
+                color: "#f4f3ee",
+                font: '600 11px "Space Grotesk", sans-serif',
+                letterSpacing: "0.04em",
+                textTransform: "uppercase",
+                pointerEvents: "none",
+              }}
+            >
+              {externalDropPreview.kind === "audio"
+                ? "Audio"
+                : externalDropPreview.kind === "package"
+                  ? "Package"
+                  : externalDropPreview.kind === "mixed"
+                    ? "Mixed"
+                    : "Unsupported"}
+            </div>
+          </div>
+        ) : null}
+
         <div className="lt-track-layers" style={{ width: laneViewportWidth }}>
           {song ? (
             <TimelineTrackCanvas
@@ -550,44 +597,6 @@ export function TimelineCanvasPane({
                 pointerEvents: "none",
               }}
             />
-          ) : null}
-
-          {externalDropPreview !== null ? (
-            <div
-              aria-hidden="true"
-              style={{
-                position: "absolute",
-                top: 10,
-                right: 14,
-                padding: "6px 10px",
-                borderRadius: 999,
-                background:
-                  externalDropPreview.kind === "audio"
-                    ? "rgba(122,229,130,0.18)"
-                    : externalDropPreview.kind === "package"
-                      ? "rgba(255,184,107,0.18)"
-                      : "rgba(255,107,107,0.18)",
-                border:
-                  externalDropPreview.kind === "audio"
-                    ? "1px solid rgba(122,229,130,0.34)"
-                    : externalDropPreview.kind === "package"
-                      ? "1px solid rgba(255,184,107,0.34)"
-                      : "1px solid rgba(255,107,107,0.34)",
-                color: "#f4f3ee",
-                font: '600 11px "Space Grotesk", sans-serif',
-                letterSpacing: "0.04em",
-                textTransform: "uppercase",
-                pointerEvents: "none",
-              }}
-            >
-              {externalDropPreview.kind === "audio"
-                ? "Audio"
-                : externalDropPreview.kind === "package"
-                  ? "Package"
-                  : externalDropPreview.kind === "mixed"
-                    ? "Mixed"
-                    : "Unsupported"}
-            </div>
           ) : null}
 
           {shouldShowEmptyArrangementHint ? (
