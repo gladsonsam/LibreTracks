@@ -488,16 +488,21 @@ fn run_streaming_worker(
 ) {
     let mut start_seconds = initial_start_seconds;
     let mut generation = 0;
+    let mut pitch_engine = pitch::create_pitch_shift_engine(
+        output_sample_rate,
+        source.channels.max(1),
+        transpose_semitones,
+    );
 
     loop {
         match stream_decode_from(
             &source,
             output_sample_rate,
             start_seconds,
-            transpose_semitones,
             generation,
             &mut producer,
             &command_receiver,
+            &mut pitch_engine,
         ) {
             WorkerOutcome::Restart {
                 start_seconds: next_start,
@@ -531,20 +536,16 @@ fn stream_decode_from(
     source: &StreamingAudioSource,
     output_sample_rate: u32,
     start_seconds: f64,
-    transpose_semitones: i32,
     generation: u64,
     producer: &mut Producer<ClipSample>,
     command_receiver: &Receiver<StreamingWorkerCommand>,
+    pitch_engine: &mut Box<dyn pitch::PitchShiftEngine>,
 ) -> WorkerOutcome {
     let mut decoder = match StreamingDecoder::open(source, output_sample_rate, start_seconds) {
         Ok(decoder) => decoder,
         Err(_) => return WorkerOutcome::Finished,
     };
-    let mut pitch_engine = pitch::create_pitch_shift_engine(
-        output_sample_rate,
-        source.channels.max(1),
-        transpose_semitones,
-    );
+    pitch_engine.reset();
     let channels = source.channels.max(1);
     let mut frames_to_discard = pitch_engine.latency_frames();
 
