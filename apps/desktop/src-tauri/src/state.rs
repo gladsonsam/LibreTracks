@@ -734,14 +734,14 @@ impl DesktopSession {
 
             let current_song = self.engine.song().cloned();
             let mut library_assets = list_library_assets(&song_dir, current_song.as_ref())?;
-            for asset in imported_assets {
+            for asset in &imported_assets {
                 if let Some(existing_asset) = library_assets
                     .iter_mut()
                     .find(|existing_asset| existing_asset.file_path == asset.file_path)
                 {
-                    *existing_asset = asset;
+                    *existing_asset = asset.clone();
                 } else {
-                    library_assets.push(asset);
+                    library_assets.push(asset.clone());
                 }
             }
 
@@ -751,7 +751,7 @@ impl DesktopSession {
                     .then_with(|| left.file_name.cmp(&right.file_name))
             });
             write_library_manifest_assets(&song_dir, &library_assets)?;
-            Ok::<Vec<LibraryAssetSummary>, DesktopError>(library_assets)
+            Ok::<Vec<LibraryAssetSummary>, DesktopError>(imported_assets)
         })();
 
         if import_result.is_err() {
@@ -4790,6 +4790,72 @@ mod tests {
         assert!(assets
             .iter()
             .any(|asset| asset.file_path.replace('\\', "/") == imported_click_path));
+    }
+
+    #[test]
+    fn import_audio_files_from_bytes_returns_only_newly_imported_assets() {
+        let mut session = session_with_song_dir("library-import-bytes-demo", demo_song());
+        let song_dir = session.song_dir.clone().expect("song dir should exist");
+
+        write_silent_test_wav(&song_dir.join("audio").join("existing-a.wav"), 2);
+        write_silent_test_wav(&song_dir.join("audio").join("existing-b.wav"), 3);
+        write_silent_test_wav(&song_dir.join("audio").join("existing-c.wav"), 4);
+        write_library_manifest_assets(
+            &song_dir,
+            &[
+                LibraryAssetSummary {
+                    file_name: "existing-a.wav".into(),
+                    file_path: "audio/existing-a.wav".into(),
+                    duration_seconds: 2.0,
+                    is_missing: false,
+                    folder_path: None,
+                },
+                LibraryAssetSummary {
+                    file_name: "existing-b.wav".into(),
+                    file_path: "audio/existing-b.wav".into(),
+                    duration_seconds: 3.0,
+                    is_missing: false,
+                    folder_path: None,
+                },
+                LibraryAssetSummary {
+                    file_name: "existing-c.wav".into(),
+                    file_path: "audio/existing-c.wav".into(),
+                    duration_seconds: 4.0,
+                    is_missing: false,
+                    folder_path: None,
+                },
+            ],
+        )
+        .expect("manifest should save");
+
+        let imports_root = tempdir().expect("temp dir should exist");
+        let dropped_a = imports_root.path().join("dropped-a.wav");
+        let dropped_b = imports_root.path().join("dropped-b.wav");
+        write_silent_test_wav(&dropped_a, 5);
+        write_silent_test_wav(&dropped_b, 6);
+
+        let imported_assets = session
+            .import_audio_files_from_bytes(&[
+                AudioFileImportPayload {
+                    file_name: "dropped-a.wav".into(),
+                    bytes: fs::read(&dropped_a).expect("first dropped wav should read"),
+                },
+                AudioFileImportPayload {
+                    file_name: "dropped-b.wav".into(),
+                    bytes: fs::read(&dropped_b).expect("second dropped wav should read"),
+                },
+            ])
+            .expect("byte import should succeed");
+
+        assert_eq!(imported_assets.len(), 2);
+        assert!(imported_assets.iter().any(|asset| asset.file_path == "audio/dropped-a.wav"));
+        assert!(imported_assets.iter().any(|asset| asset.file_path == "audio/dropped-b.wav"));
+        assert!(imported_assets.iter().all(|asset| asset.file_name.starts_with("dropped-")));
+
+        let all_assets = session
+            .get_library_assets()
+            .expect("full library assets should still load");
+        assert_eq!(all_assets.len(), 6);
     }
 
     #[test]
