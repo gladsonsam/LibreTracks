@@ -5418,7 +5418,7 @@ export function TransportPanelContent() {
       }
 
       await handleDroppedAudioFiles(classification.audioFiles, dropSeconds);
-    }, { busy: true });
+    }, classification.kind === "package" ? { busy: true } : undefined);
   }
 
   function handleTrackListLibraryDragLeave(event: ReactDragEvent<HTMLDivElement>) {
