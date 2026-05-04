@@ -25,10 +25,12 @@ type MockWebviewDragDropEvent =
     };
 
 let nativeDragDropHandler: ((event: MockWebviewDragDropEvent) => void) | null = null;
+let mockNativeWebviewPosition = { x: 0, y: 0 };
 const originalPointerEvent = window.PointerEvent;
 
 vi.mock("@tauri-apps/api/webview", () => ({
   getCurrentWebview: () => ({
+    position: async () => mockNativeWebviewPosition,
     onDragDropEvent: async (handler: (event: MockWebviewDragDropEvent) => void) => {
       nativeDragDropHandler = handler;
       return () => {
@@ -182,6 +184,7 @@ async function chooseSongJumpTrigger(triggerLabel: string) {
 
 beforeEach(async () => {
   nativeDragDropHandler = null;
+  mockNativeWebviewPosition = { x: 0, y: 0 };
   Object.defineProperty(window, "PointerEvent", {
     configurable: true,
     value: originalPointerEvent,
@@ -228,6 +231,12 @@ async function emitNativeDropEvent(event: MockWebviewDragDropEvent) {
   await act(async () => {
     nativeDragDropHandler?.(event);
   });
+}
+
+function getExternalDropGuide(container: HTMLElement) {
+  return Array.from(container.querySelectorAll('[aria-hidden="true"]')).find(
+    (element): element is HTMLElement => element instanceof HTMLElement && element.style.width === "2px",
+  ) ?? null;
 }
 
 function createFileList(files: File[]) {
@@ -1062,6 +1071,87 @@ describe("App", () => {
     });
 
     expect(screen.getByText("Drop")).toBeTruthy();
+  });
+
+  it("aligns the native external drop guide when positions are desktop-relative", async () => {
+    const originalDevicePixelRatio = window.devicePixelRatio;
+    const debugSpy = vi.spyOn(console, "debug").mockImplementation(() => {});
+    Object.defineProperty(window, "devicePixelRatio", {
+      configurable: true,
+      value: 1,
+    });
+
+    try {
+      mockNativeWebviewPosition = { x: 0, y: 0 };
+      const firstView = await renderApp();
+      mockRulerBounds(firstView.container);
+      mockLaneBounds(firstView.container);
+      mockTrackListBounds(firstView.container);
+      mockTimelinePaneBounds(firstView.container);
+
+      await act(async () => {
+        await Promise.resolve();
+      });
+
+      await act(async () => {
+        await emitNativeDropEvent({
+          payload: {
+            type: "over",
+            paths: ["C:/mock/imports/lead.wav"],
+            position: { x: 420, y: 180 },
+          },
+        });
+      });
+
+      const baselineHit = debugSpy.mock.calls.filter(([label]) => label === "[native-dnd] over hit").at(-1)?.[1];
+      expect(baselineHit).toMatchObject({
+        isOverTimeline: true,
+        dropSeconds: 3.5,
+        targetTrackId: null,
+      });
+
+      firstView.unmount();
+      useTimelineUIStore.setState({
+        cameraX: 0,
+        zoomLevel: TIMELINE_DEFAULT_ZOOM_LEVEL,
+        trackHeight: TIMELINE_DEFAULT_TRACK_HEIGHT,
+        selectedTrackIds: [],
+        selectedClipId: null,
+        selectedSectionId: null,
+        snapEnabled: TIMELINE_DEFAULT_SNAP_ENABLED,
+        midiLearnMode: null,
+      });
+
+      mockNativeWebviewPosition = { x: 300, y: 80 };
+      const secondView = await renderApp();
+      mockRulerBounds(secondView.container);
+      mockLaneBounds(secondView.container);
+      mockTrackListBounds(secondView.container);
+      mockTimelinePaneBounds(secondView.container);
+
+      await act(async () => {
+        await Promise.resolve();
+      });
+
+      await act(async () => {
+        await emitNativeDropEvent({
+          payload: {
+            type: "over",
+            paths: ["C:/mock/imports/lead.wav"],
+            position: { x: 720, y: 260 },
+          },
+        });
+      });
+
+      const offsetHit = debugSpy.mock.calls.filter(([label]) => label === "[native-dnd] over hit").at(-1)?.[1];
+      expect(offsetHit).toEqual(baselineHit);
+    } finally {
+      debugSpy.mockRestore();
+      Object.defineProperty(window, "devicePixelRatio", {
+        configurable: true,
+        value: originalDevicePixelRatio,
+      });
+    }
   });
 
   it("marks pending external audio imports as failed when the import rejects", async () => {

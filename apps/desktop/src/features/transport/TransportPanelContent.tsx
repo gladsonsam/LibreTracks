@@ -518,18 +518,32 @@ function toClientPointFromNativePosition(position: { x: number; y: number }) {
   };
 }
 
-function nativeClientPointCandidates(position: { x: number; y: number }) {
+function nativeClientPointCandidates(
+  position: { x: number; y: number },
+  webviewPosition: { x: number; y: number } | null,
+) {
   const scaleFactor = window.devicePixelRatio || 1;
-  return [
-    {
-      clientX: position.x,
-      clientY: position.y,
-    },
-    {
-      clientX: position.x / scaleFactor,
-      clientY: position.y / scaleFactor,
-    },
-  ];
+  const candidates = new Map<string, { clientX: number; clientY: number }>();
+
+  const addCandidate = (clientX: number, clientY: number) => {
+    const key = `${clientX}:${clientY}`;
+    if (!candidates.has(key)) {
+      candidates.set(key, { clientX, clientY });
+    }
+  };
+
+  if (webviewPosition) {
+    addCandidate(position.x - webviewPosition.x, position.y - webviewPosition.y);
+    addCandidate(
+      (position.x - webviewPosition.x) / scaleFactor,
+      (position.y - webviewPosition.y) / scaleFactor,
+    );
+  }
+
+  addCandidate(position.x, position.y);
+  addCandidate(position.x / scaleFactor, position.y / scaleFactor);
+
+  return [...candidates.values()];
 }
 
 function formatMusicalPosition(seconds: number, song: SongView | null | undefined) {
@@ -1078,9 +1092,24 @@ export function TransportPanelContent() {
 
     let disposed = false;
     let unlisten: (() => void) | null = null;
+    const currentWebview = getCurrentWebview();
 
-    void getCurrentWebview()
-      .onDragDropEvent((event) => {
+    void (async () => {
+      try {
+        const position = await currentWebview.position();
+        if (disposed) {
+          return;
+        }
+
+        nativeWebviewPositionRef.current = {
+          x: position.x,
+          y: position.y,
+        };
+      } catch {
+        nativeWebviewPositionRef.current = null;
+      }
+
+      const dispose = await currentWebview.onDragDropEvent((event) => {
         const payload = event.payload;
 
         if (payload.type === "over") {
@@ -1101,15 +1130,15 @@ export function TransportPanelContent() {
 
         nativeExternalDropPathsRef.current = [];
         setExternalDropPreview(null);
-      })
-      .then((dispose) => {
-        if (disposed) {
-          dispose();
-          return;
-        }
+      });
 
-        unlisten = dispose;
-      })
+      if (disposed) {
+        dispose();
+        return;
+      }
+
+      unlisten = dispose;
+    })()
       .catch((error) => {
         console.error("[native-dnd] failed to register drag/drop listener", error);
         nativeExternalDropPathsRef.current = [];
@@ -1160,6 +1189,7 @@ export function TransportPanelContent() {
   const renderMetricTimeoutRef = useRef<number | null>(null);
   const pendingRenderMetricRef = useRef(0);
   const nativeExternalDropPathsRef = useRef<string[]>([]);
+  const nativeWebviewPositionRef = useRef<{ x: number; y: number } | null>(null);
   const transportReadoutTempoRef = useRef<HTMLElement | null>(null);
   const transportReadoutValueRef = useRef<HTMLElement | null>(null);
   const transportReadoutBarRef = useRef<HTMLElement | null>(null);
@@ -5172,7 +5202,7 @@ export function TransportPanelContent() {
   }
 
   function resolveTimelineDropFromNativePosition(position: { x: number; y: number }) {
-    for (const clientPoint of nativeClientPointCandidates(position)) {
+    for (const clientPoint of nativeClientPointCandidates(position, nativeWebviewPositionRef.current)) {
       const hit = resolveTimelineDropFromClientPoint(clientPoint.clientX, clientPoint.clientY);
       if (hit.isOverTimeline) {
         return hit;
