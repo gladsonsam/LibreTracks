@@ -35,6 +35,13 @@ import {
   snapToTimelineGrid,
   type TimelineGrid,
 } from "./timelineMath";
+import {
+  classifyDroppedFiles,
+  getDroppedFiles,
+  isExternalFileDrag,
+  type DroppedFileClassification,
+  type ExternalDropPreview,
+} from "./dragDrop";
 
 const RULER_HEIGHT = 132;
 
@@ -82,7 +89,7 @@ type TimelineCanvasPaneProps = {
   scrollViewportRef: RefObject<HTMLDivElement | null>;
   libraryClipPreview: LibraryClipPreviewState[];
   libraryPreviewRows: LibraryPreviewRow[];
-  packageDropPreviewSeconds: number | null;
+  externalDropPreview: ExternalDropPreview | null;
   shouldShowEmptyArrangementHint: boolean;
   normalizePositionSeconds: (positionSeconds: number) => number;
   resolveLibraryGhostLeft: (seconds: number) => number;
@@ -129,9 +136,8 @@ type TimelineCanvasPaneProps = {
   onTrackLaneLibraryDrop: (event: ReactDragEvent<HTMLDivElement>, track: TrackSummary) => void;
   onLibraryPreviewLaneDragOver: (event: ReactDragEvent<HTMLDivElement>) => void;
   onLibraryPreviewLaneDrop: (event: ReactDragEvent<HTMLDivElement>) => void;
-  onExternalPackageDragOver: (seconds: number) => void;
-  onExternalPackageDragLeave: () => void;
-  onExternalPackageDrop: (file: File, seconds: number) => void;
+  onExternalDropPreviewChange: (preview: ExternalDropPreview | null) => void;
+  onExternalDrop: (classification: DroppedFileClassification, seconds: number) => void;
 };
 
 export function TimelineCanvasPane({
@@ -163,7 +169,7 @@ export function TimelineCanvasPane({
   scrollViewportRef,
   libraryClipPreview,
   libraryPreviewRows,
-  packageDropPreviewSeconds,
+  externalDropPreview,
   shouldShowEmptyArrangementHint,
   normalizePositionSeconds,
   resolveLibraryGhostLeft,
@@ -196,9 +202,8 @@ export function TimelineCanvasPane({
   onTrackLaneLibraryDrop,
   onLibraryPreviewLaneDragOver,
   onLibraryPreviewLaneDrop,
-  onExternalPackageDragOver,
-  onExternalPackageDragLeave,
-  onExternalPackageDrop,
+  onExternalDropPreviewChange,
+  onExternalDrop,
 }: TimelineCanvasPaneProps) {
   const { t } = useTranslation();
 
@@ -207,35 +212,7 @@ export function TimelineCanvasPane({
     event.dataTransfer.dropEffect = "copy";
   };
 
-  const isExternalFileDrag = (event: ReactDragEvent<HTMLDivElement>) => {
-    const types = event.dataTransfer.types as unknown as {
-      length: number;
-      [index: number]: string;
-      contains?: (value: string) => boolean;
-      includes?: (value: string) => boolean;
-    };
-    if (!types) {
-      return false;
-    }
-
-    if (typeof types.includes === "function") {
-      return types.includes("Files");
-    }
-
-    if (typeof types.contains === "function") {
-      return types.contains("Files");
-    }
-
-    for (let index = 0; index < types.length; index += 1) {
-      if (types[index] === "Files") {
-        return true;
-      }
-    }
-
-    return false;
-  };
-
-  const resolveExternalPackageDropSeconds = (clientX: number, element: HTMLElement) => {
+  const resolveExternalDropSeconds = (clientX: number, element: HTMLElement) => {
     const rawSeconds = clientXToTimelineSeconds(clientX, element, scrollViewportRef.current, pixelsPerSecond);
     if (!song) {
       return rawSeconds;
@@ -251,19 +228,23 @@ export function TimelineCanvasPane({
     );
   };
 
-  const handleExternalPackageDragOver = (event: ReactDragEvent<HTMLDivElement>) => {
-    if (!isExternalFileDrag(event)) {
+  const handleExternalDragOver = (event: ReactDragEvent<HTMLDivElement>) => {
+    if (!isExternalFileDrag(event.dataTransfer)) {
       return;
     }
 
+    const classification = classifyDroppedFiles(getDroppedFiles(event.dataTransfer));
     event.preventDefault();
     event.stopPropagation();
     event.dataTransfer.dropEffect = "copy";
-    onExternalPackageDragOver(resolveExternalPackageDropSeconds(event.clientX, event.currentTarget));
+    onExternalDropPreviewChange({
+      kind: classification.kind,
+      seconds: resolveExternalDropSeconds(event.clientX, event.currentTarget),
+    });
   };
 
-  const handleExternalPackageDragLeave = (event: ReactDragEvent<HTMLDivElement>) => {
-    if (!isExternalFileDrag(event)) {
+  const handleExternalDragLeave = (event: ReactDragEvent<HTMLDivElement>) => {
+    if (!isExternalFileDrag(event.dataTransfer)) {
       return;
     }
 
@@ -272,37 +253,27 @@ export function TimelineCanvasPane({
       return;
     }
 
-    onExternalPackageDragLeave();
+    onExternalDropPreviewChange(null);
   };
 
-  const handleExternalPackageDrop = (event: ReactDragEvent<HTMLDivElement>) => {
-    if (!isExternalFileDrag(event)) {
+  const handleExternalDrop = (event: ReactDragEvent<HTMLDivElement>) => {
+    if (!isExternalFileDrag(event.dataTransfer)) {
       return;
     }
 
+    const classification = classifyDroppedFiles(getDroppedFiles(event.dataTransfer));
     event.preventDefault();
     event.stopPropagation();
-
-    const file = event.dataTransfer.files[0] ?? null;
-    if (!file) {
-      onExternalPackageDragLeave();
-      return;
-    }
-
-    if (!file.name.toLowerCase().endsWith(".ltpkg")) {
-      onExternalPackageDragLeave();
-      return;
-    }
-
-    onExternalPackageDrop(file, resolveExternalPackageDropSeconds(event.clientX, event.currentTarget));
+    onExternalDropPreviewChange(null);
+    onExternalDrop(classification, resolveExternalDropSeconds(event.clientX, event.currentTarget));
   };
 
   return (
     <div
       className="lt-timeline-canvas-pane"
-      onDragOver={handleExternalPackageDragOver}
-      onDragLeave={handleExternalPackageDragLeave}
-      onDrop={handleExternalPackageDrop}
+      onDragOver={handleExternalDragOver}
+      onDragLeave={handleExternalDragLeave}
+      onDrop={handleExternalDrop}
     >
       <div
         className="lt-ruler-track"
@@ -555,20 +526,68 @@ export function TimelineCanvasPane({
             />
           </div>
 
-          {packageDropPreviewSeconds !== null ? (
+          {externalDropPreview !== null ? (
             <div
               aria-hidden="true"
               style={{
                 position: "absolute",
                 top: 0,
                 bottom: 0,
-                left: resolveLibraryGhostLeft(packageDropPreviewSeconds),
+                left: resolveLibraryGhostLeft(externalDropPreview.seconds),
                 width: 2,
-                background: "#ffb86b",
-                boxShadow: "0 0 0 1px rgba(255,184,107,0.22), 0 0 18px rgba(255,184,107,0.42)",
+                background:
+                  externalDropPreview.kind === "audio"
+                    ? "#7ae582"
+                    : externalDropPreview.kind === "package"
+                      ? "#ffb86b"
+                      : "#ff6b6b",
+                boxShadow:
+                  externalDropPreview.kind === "audio"
+                    ? "0 0 0 1px rgba(122,229,130,0.24), 0 0 18px rgba(122,229,130,0.44)"
+                    : externalDropPreview.kind === "package"
+                      ? "0 0 0 1px rgba(255,184,107,0.22), 0 0 18px rgba(255,184,107,0.42)"
+                      : "0 0 0 1px rgba(255,107,107,0.22), 0 0 18px rgba(255,107,107,0.42)",
                 pointerEvents: "none",
               }}
             />
+          ) : null}
+
+          {externalDropPreview !== null ? (
+            <div
+              aria-hidden="true"
+              style={{
+                position: "absolute",
+                top: 10,
+                right: 14,
+                padding: "6px 10px",
+                borderRadius: 999,
+                background:
+                  externalDropPreview.kind === "audio"
+                    ? "rgba(122,229,130,0.18)"
+                    : externalDropPreview.kind === "package"
+                      ? "rgba(255,184,107,0.18)"
+                      : "rgba(255,107,107,0.18)",
+                border:
+                  externalDropPreview.kind === "audio"
+                    ? "1px solid rgba(122,229,130,0.34)"
+                    : externalDropPreview.kind === "package"
+                      ? "1px solid rgba(255,184,107,0.34)"
+                      : "1px solid rgba(255,107,107,0.34)",
+                color: "#f4f3ee",
+                font: '600 11px "Space Grotesk", sans-serif',
+                letterSpacing: "0.04em",
+                textTransform: "uppercase",
+                pointerEvents: "none",
+              }}
+            >
+              {externalDropPreview.kind === "audio"
+                ? "Audio"
+                : externalDropPreview.kind === "package"
+                  ? "Package"
+                  : externalDropPreview.kind === "mixed"
+                    ? "Mixed"
+                    : "Unsupported"}
+            </div>
           ) : null}
 
           {shouldShowEmptyArrangementHint ? (

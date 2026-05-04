@@ -267,6 +267,8 @@ const es = {
       libraryImportStarting: "Preparando importacion de assets...",
       songImported: "Cancion importada en la sesion actual.",
       packageImportedAt: "Paquete importado en {{time}}.",
+      externalDropMixed: "Suelta un paquete de cancion o archivos de audio, no ambos.",
+      externalDropUnsupported: "Tipo de archivo no compatible. Suelta archivos de audio o un paquete .ltpkg.",
       midiWarningHidden: "El aviso de dispositivo MIDI ausente no se mostrara de nuevo.",
     },
     midiWarning: {

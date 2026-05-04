@@ -127,6 +127,11 @@ export type LibraryAssetSummary = {
   folderPath?: string | null;
 };
 
+export type AudioFileImportPayload = {
+  fileName: string;
+  bytes: Uint8Array | number[];
+};
+
 export type DesktopPerformanceSnapshot = {
   copyMillis: number;
   wavAnalysisMillis: number;

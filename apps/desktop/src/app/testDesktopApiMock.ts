@@ -46,6 +46,7 @@ const MOCK_SONG_FILE_PATH = `${MOCK_SONG_DIR}/song.ltsession`;
 
 let state = buildInitialState();
 let idCounter = 0;
+let waveformReadyListeners: Array<(event: WaveformReadyEvent) => void> = [];
 
 function clone<T>(value: T): T {
   return JSON.parse(JSON.stringify(value)) as T;
@@ -591,13 +592,33 @@ function createRegionFromSelection(startSeconds: number, endSeconds: number): So
 export function resetTestDesktopApiMock() {
   idCounter = 0;
   state = buildInitialState();
+  waveformReadyListeners = [];
+}
+
+export function emitWaveformReadyForTest(filePath: string, durationSeconds: number) {
+  const summary = buildWaveformSummary(filePath, durationSeconds);
+  state.waveforms[filePath] = summary;
+  const event: WaveformReadyEvent = {
+    songDir: state.songDir,
+    waveformKey: filePath,
+    summary: clone(summary),
+  };
+
+  for (const listener of waveformReadyListeners) {
+    listener(clone(event));
+  }
 }
 
 export const testDesktopApiMock = {
   listenToTransportLifecycle: async (_handler: (event: TransportLifecycleEvent) => void) => () => {},
   listenToAudioMeters: async (_handler: (levels: AudioMeterLevel[]) => void) => () => {},
   listenToLibraryImportProgress: async (_handler: (event: LibraryImportProgressEvent) => void) => () => {},
-  listenToWaveformReady: async (_handler: (event: WaveformReadyEvent) => void) => () => {},
+  listenToWaveformReady: async (handler: (event: WaveformReadyEvent) => void) => {
+    waveformReadyListeners.push(handler);
+    return () => {
+      waveformReadyListeners = waveformReadyListeners.filter((listener) => listener !== handler);
+    };
+  },
   listenToSettingsUpdated: async (_handler: (settings: AppSettings) => void) => () => {},
   listenToMidiRawMessage: async (_handler: (message: { status: number; data1: number; data2: number }) => void) => () => {},
   getTransportSnapshot: async () => clone(buildSnapshot()),
@@ -711,8 +732,40 @@ export const testDesktopApiMock = {
   },
   pickAndImportSong: async () => clone(buildSnapshot()),
   importLibraryAssetsFromDialog: async () => clone(state.libraryAssets),
+  importAudioFilesFromBytes: async (files: Array<{ fileName: string; bytes: Uint8Array | number[] }>) => {
+    const importedAssets = files.map((file, index) => {
+      const normalizedName = file.fileName.replace(/^.*[\\/]/, "");
+      const filePath = `audio/${normalizedName}`;
+      const durationSeconds = 45 + index * 15;
+      return {
+        fileName: normalizedName,
+        filePath,
+        durationSeconds,
+        isMissing: false,
+        folderPath: null,
+      } satisfies LibraryAssetSummary;
+    });
+
+    for (const asset of importedAssets) {
+      if (!state.libraryAssets.some((existing) => existing.filePath === asset.filePath)) {
+        state.libraryAssets.push(asset);
+      }
+      delete state.waveforms[asset.filePath];
+    }
+
+    state.libraryAssets = sortLibraryAssets(state.libraryAssets);
+    return clone(importedAssets);
+  },
   exportRegionAsPackage: async (_regionId: string) => {},
   importSongPackage: async (_packagePath: string, _insertAtSeconds: number) => clone(buildSnapshot()),
+  importSongPackageFromBytes: async (_packageBytes: Uint8Array | number[], _insertAtSeconds: number) => {
+    replaceSong({
+      ...state.song,
+      projectRevision: state.projectRevision + 1,
+    });
+    return clone(buildSnapshot());
+  },
+  importSongPackageFromBase64: async (_packageBase64: string, _insertAtSeconds: number) => clone(buildSnapshot()),
   resolveMissingFile: async (oldPath: string, newPath: string) => {
     state.libraryAssets = sortLibraryAssets(
       state.libraryAssets.map((asset) =>
@@ -1103,7 +1156,6 @@ export const testDesktopApiMock = {
       const track = getTrack(entry.trackId);
       const asset = findLibraryAsset(entry.filePath);
       const durationSeconds = asset?.durationSeconds ?? 180;
-      ensureWaveform(entry.filePath, durationSeconds);
       nextClips.push({
         id: nextId("clip"),
         trackId: entry.trackId,

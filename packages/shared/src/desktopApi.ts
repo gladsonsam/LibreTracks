@@ -1,5 +1,6 @@
 import type {
   AppSettings,
+  AudioFileImportPayload,
   AudioMeterLevel,
   AudioOutputDevices,
   CreateClipArgs,
@@ -210,6 +211,12 @@ export async function pickAndImportSong(): Promise<TransportSnapshot | null> {
 
 export async function importLibraryAssetsFromDialog(): Promise<LibraryAssetSummary[] | null> {
   return invokeCommand<LibraryAssetSummary[] | null>("import_library_assets_from_dialog");
+}
+
+export async function importAudioFilesFromBytes(
+  files: AudioFileImportPayload[],
+): Promise<LibraryAssetSummary[]> {
+  return invokeCommand<LibraryAssetSummary[]>("import_audio_files_from_bytes", { files });
 }
 
 export async function exportRegionAsPackage(regionId: string): Promise<void> {

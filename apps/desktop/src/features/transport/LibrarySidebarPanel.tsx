@@ -10,8 +10,8 @@ import {
 import { useTranslation } from "react-i18next";
 
 import type { LibraryAssetSummary, LibraryImportProgressEvent } from "./desktopApi";
+import { LIBRARY_ASSET_DRAG_MIME } from "./dragDrop";
 
-const LIBRARY_ASSET_DRAG_MIME = "application/libretracks-library-assets";
 const INTERNAL_DRAG_START_EVENT = "libretracks-internal-drag-start";
 const INTERNAL_DRAG_END_EVENT = "libretracks-internal-drag-end";
 const ROOT_GROUP_ID = "__root__";

@@ -267,6 +267,8 @@ const en = {
       libraryImportStarting: "Preparing asset import...",
       songImported: "Song imported into the current session.",
       packageImportedAt: "Package imported at {{time}}.",
+      externalDropMixed: "Drop either a song package or audio files, not both.",
+      externalDropUnsupported: "Unsupported file type. Drop audio files or a .ltpkg package.",
       midiWarningHidden: "The missing MIDI device warning will not be shown again.",
     },
     midiWarning: {

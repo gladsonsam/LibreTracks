@@ -11,6 +11,7 @@ import {
   useTimelineUIStore,
 } from "../features/transport/uiStore";
 import { App } from "./App";
+import { emitWaveformReadyForTest, resetTestDesktopApiMock } from "./testDesktopApiMock";
 
 vi.mock("../features/transport/desktopApi", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../features/transport/desktopApi")>();
@@ -49,6 +50,10 @@ vi.mock("../features/transport/desktopApi", async (importOriginal) => {
     openProject: vi.fn(testDesktopApiMock.openProject),
     pickAndImportSong: vi.fn(testDesktopApiMock.pickAndImportSong),
     importLibraryAssetsFromDialog: vi.fn(testDesktopApiMock.importLibraryAssetsFromDialog),
+    importAudioFilesFromBytes: vi.fn(testDesktopApiMock.importAudioFilesFromBytes),
+    importSongPackage: vi.fn(testDesktopApiMock.importSongPackage),
+    importSongPackageFromBytes: vi.fn(testDesktopApiMock.importSongPackageFromBytes),
+    importSongPackageFromBase64: vi.fn(testDesktopApiMock.importSongPackageFromBase64),
     deleteLibraryAsset: vi.fn(testDesktopApiMock.deleteLibraryAsset),
     moveLibraryAsset: vi.fn(testDesktopApiMock.moveLibraryAsset),
     createLibraryFolder: vi.fn(testDesktopApiMock.createLibraryFolder),
@@ -148,7 +153,6 @@ async function chooseSongJumpTrigger(triggerLabel: string) {
 }
 
 beforeEach(async () => {
-  const { resetTestDesktopApiMock } = await import("./testDesktopApiMock");
   resetTestDesktopApiMock();
   useTransportStore.setState({
     meters: {},
@@ -175,6 +179,34 @@ afterEach(() => {
 });
 
 const LIBRARY_ASSET_DRAG_MIME = "application/libretracks-library-assets";
+
+function createFileList(files: File[]) {
+  return {
+    length: files.length,
+    item: (index: number) => files[index] ?? null,
+    ...files,
+  } as unknown as FileList;
+}
+
+function createExternalFileDataTransfer(files: File[]) {
+  return {
+    dropEffect: "",
+    effectAllowed: "",
+    files: createFileList(files),
+    types: ["Files"],
+    getData: vi.fn(() => ""),
+    setData: vi.fn(),
+  };
+}
+
+function createTestFile(fileName: string, bytes: number[], type = "application/octet-stream") {
+  const file = new File([Uint8Array.from(bytes)], fileName, { type });
+  Object.defineProperty(file, "arrayBuffer", {
+    configurable: true,
+    value: async () => Uint8Array.from(bytes).buffer,
+  });
+  return file;
+}
 
 async function renderApp() {
   const view = render(<App />);
@@ -287,6 +319,26 @@ function mockTrackListBounds(container: HTMLElement, width = 1400, height = 500)
     configurable: true,
     writable: true,
     value: 0,
+  });
+}
+
+function mockTimelinePaneBounds(container: HTMLElement, width = 1400, height = 500) {
+  const pane = container.querySelector(".lt-timeline-canvas-pane") as HTMLDivElement | null;
+  expect(pane).toBeTruthy();
+
+  Object.defineProperty(pane, "getBoundingClientRect", {
+    configurable: true,
+    value: () => ({
+      left: 0,
+      right: width,
+      top: 0,
+      bottom: height,
+      width,
+      height,
+      x: 0,
+      y: 0,
+      toJSON: () => ({}),
+    }),
   });
 }
 
@@ -768,6 +820,115 @@ describe("App", () => {
       await screen.findByText(textMatcher(interpolate(en.transport.status.clipsAdded, { count: 2 }))),
     ).toBeTruthy();
     expect(await screen.findByText(interpolate(en.timelineToolbar.clipsCount, { count: 6 }))).toBeTruthy();
+  });
+
+  it("drops a song package on the timeline", async () => {
+    const { container } = await renderApp();
+    mockRulerBounds(container);
+    mockLaneBounds(container);
+    mockTrackListBounds(container);
+    mockTimelinePaneBounds(container);
+
+    const timelinePane = container.querySelector(".lt-timeline-canvas-pane") as HTMLElement | null;
+    expect(timelinePane).toBeTruthy();
+
+    const dataTransfer = createExternalFileDataTransfer([
+      createTestFile("session.ltpkg", [1, 2, 3]),
+    ]);
+
+    await act(async () => {
+      fireEvent.dragOver(timelinePane as HTMLElement, { dataTransfer, clientX: 420, clientY: 180 });
+      fireEvent.drop(timelinePane as HTMLElement, { dataTransfer, clientX: 420, clientY: 180 });
+    });
+
+    expect(await screen.findByText(/package imported at/i)).toBeTruthy();
+  });
+
+  it("drops audio files on the timeline, imports them, and creates one new track per file", async () => {
+    const desktopApi = await import("../features/transport/desktopApi");
+    const getWaveformSummariesMock = vi.mocked(desktopApi.getWaveformSummaries);
+    const { container } = await renderApp();
+    mockRulerBounds(container);
+    mockLaneBounds(container);
+    mockTrackListBounds(container);
+    mockTimelinePaneBounds(container);
+
+    const timelinePane = container.querySelector(".lt-timeline-canvas-pane") as HTMLElement | null;
+    expect(timelinePane).toBeTruthy();
+
+    const dataTransfer = createExternalFileDataTransfer([
+      createTestFile("lead.wav", [1, 2, 3], "audio/wav"),
+      createTestFile("pad.mp3", [4, 5, 6], "audio/mpeg"),
+    ]);
+
+    await act(async () => {
+      fireEvent.dragOver(timelinePane as HTMLElement, { dataTransfer, clientX: 420, clientY: 180 });
+      fireEvent.drop(timelinePane as HTMLElement, { dataTransfer, clientX: 420, clientY: 180 });
+    });
+
+    expect(
+      await screen.findByText(textMatcher(interpolate(en.transport.status.clipsAdded, { count: 2 }))),
+    ).toBeTruthy();
+    expect(screen.getByText("Lead")).toBeTruthy();
+    expect(screen.getByText("Pad")).toBeTruthy();
+
+    await waitFor(() => {
+      expect(
+        getWaveformSummariesMock.mock.calls.some(([waveformKeys]) =>
+          waveformKeys.includes("audio/lead.wav") && waveformKeys.includes("audio/pad.mp3"),
+        ),
+      ).toBe(true);
+    });
+
+    await act(async () => {
+      emitWaveformReadyForTest("audio/lead.wav", 45);
+      emitWaveformReadyForTest("audio/pad.mp3", 60);
+    });
+  });
+
+  it("rejects mixed external drops", async () => {
+    const { container } = await renderApp();
+    mockRulerBounds(container);
+    mockLaneBounds(container);
+    mockTrackListBounds(container);
+    mockTimelinePaneBounds(container);
+
+    const timelinePane = container.querySelector(".lt-timeline-canvas-pane") as HTMLElement | null;
+    expect(timelinePane).toBeTruthy();
+
+    const dataTransfer = createExternalFileDataTransfer([
+      createTestFile("session.ltpkg", [1]),
+      createTestFile("lead.wav", [2], "audio/wav"),
+    ]);
+
+    await act(async () => {
+      fireEvent.dragOver(timelinePane as HTMLElement, { dataTransfer, clientX: 420, clientY: 180 });
+      fireEvent.drop(timelinePane as HTMLElement, { dataTransfer, clientX: 420, clientY: 180 });
+    });
+
+    expect(await screen.findByText(textMatcher(en.transport.status.externalDropMixed))).toBeTruthy();
+  });
+
+  it("rejects unsupported external drops", async () => {
+    const { container } = await renderApp();
+    mockRulerBounds(container);
+    mockLaneBounds(container);
+    mockTrackListBounds(container);
+    mockTimelinePaneBounds(container);
+
+    const timelinePane = container.querySelector(".lt-timeline-canvas-pane") as HTMLElement | null;
+    expect(timelinePane).toBeTruthy();
+
+    const dataTransfer = createExternalFileDataTransfer([
+      createTestFile("notes.txt", [1], "text/plain"),
+    ]);
+
+    await act(async () => {
+      fireEvent.dragOver(timelinePane as HTMLElement, { dataTransfer, clientX: 420, clientY: 180 });
+      fireEvent.drop(timelinePane as HTMLElement, { dataTransfer, clientX: 420, clientY: 180 });
+    });
+
+    expect(await screen.findByText(textMatcher(en.transport.status.externalDropUnsupported))).toBeTruthy();
   });
 
   it("opens the global track-list context menu in an empty project and creates the first track", async () => {

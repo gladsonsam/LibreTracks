@@ -69,7 +69,8 @@ import {
   getTransportSnapshot,
   getWaveformSummaries,
   importLibraryAssetsFromDialog,
-  importSongPackageFromBase64,
+  importAudioFilesFromBytes,
+  importSongPackageFromBytes,
   isTauriApp,
   listenToAudioMeters,
   listenToLibraryImportProgress,
@@ -142,6 +143,12 @@ import {
   TIMELINE_DEFAULT_TRACK_HEIGHT,
   useTimelineUIStore,
 } from "./uiStore";
+import {
+  LIBRARY_ASSET_DRAG_MIME,
+  isInternalLibraryDrag,
+  type DroppedFileClassification,
+  type ExternalDropPreview,
+} from "./dragDrop";
 
 const HEADER_WIDTH = 260;
 const DEFAULT_TIMELINE_VIEWPORT_WIDTH = 1100;
@@ -284,7 +291,6 @@ function buildAudioRoutingOptions(enabledChannels: number[], t: ReturnType<typeo
   return options;
 }
 
-const LIBRARY_ASSET_DRAG_MIME = "application/libretracks-library-assets";
 const LIBRARY_DRAG_EDGE_BUFFER_PX = 50;
 const LIBRARY_DRAG_MAX_SCROLL_SPEED_PX = 22;
 const MIDI_NOTE_NAMES = [
@@ -476,12 +482,7 @@ function readLibraryAssetDragPayload(dataTransfer: DataTransfer | null): Library
 }
 
 function hasLibraryAssetDragType(dataTransfer: DataTransfer | null) {
-  if (!dataTransfer) {
-    return false;
-  }
-
-  const dragTypes = Array.from(dataTransfer.types ?? []);
-  return dragTypes.includes(LIBRARY_ASSET_DRAG_MIME) || dragTypes.includes("text/plain");
+  return isInternalLibraryDrag(dataTransfer);
 }
 
 function debugLibraryDrag(..._args: Array<unknown>) {}
@@ -854,7 +855,7 @@ export function TransportPanelContent() {
   const [libraryAssets, setLibraryAssets] = useState<LibraryAssetSummary[]>([]);
   const [libraryFolders, setLibraryFolders] = useState<string[]>([]);
   const [libraryClipPreview, setLibraryClipPreview] = useState<LibraryClipPreviewState[]>([]);
-  const [packageDropPreviewSeconds, setPackageDropPreviewSeconds] = useState<number | null>(null);
+  const [externalDropPreview, setExternalDropPreview] = useState<ExternalDropPreview | null>(null);
   const [selectedRegionId, setSelectedRegionId] = useState<string | null>(null);
   const selectedRegion = useMemo(
     () => song?.regions.find((region) => region.id === selectedRegionId) ?? null,
@@ -5326,6 +5327,100 @@ export function TransportPanelContent() {
     );
   }
 
+  async function handleDroppedSongPackage(file: File, dropSeconds: number) {
+    const packageBytes = new Uint8Array(await file.arrayBuffer());
+    const nextSnapshot = await importSongPackageFromBytes(packageBytes, dropSeconds);
+    applyPlaybackSnapshot(nextSnapshot);
+    await refreshLibraryState();
+    setStatus(t("transport.status.packageImportedAt", { time: formatClock(dropSeconds) }));
+  }
+
+  async function handleDroppedAudioFiles(files: File[], dropSeconds: number) {
+    const importedAssets = await importAudioFilesFromBytes(
+      await Promise.all(
+        files.map(async (file) => ({
+          fileName: file.name,
+          bytes: new Uint8Array(await file.arrayBuffer()),
+        })),
+      ),
+    );
+
+    await refreshLibraryState();
+
+    const placements: Array<{
+      asset: LibraryAssetSummary;
+      trackId: string;
+      timelineStartSeconds: number;
+    }> = [];
+    let pendingTrackSnapshot: TransportSnapshot | null = null;
+    let selectedTrackId: string | null = null;
+
+    for (const asset of importedAssets) {
+      const createdTrack = await createLibraryTrackForAsset(asset);
+      if (!createdTrack.trackId) {
+        if (createdTrack.snapshot) {
+          applyPlaybackSnapshot(createdTrack.snapshot);
+        }
+        continue;
+      }
+
+      pendingTrackSnapshot = createdTrack.snapshot;
+      selectedTrackId = createdTrack.trackId;
+      placements.push({
+        asset,
+        trackId: createdTrack.trackId,
+        timelineStartSeconds: dropSeconds,
+      });
+    }
+
+    await commitLibraryClipPlacements({
+      placements,
+      pendingTrackSnapshot,
+    });
+
+    if (selectedTrackId) {
+      selectTrack([selectedTrackId]);
+    }
+
+    setSelectedSectionId(null);
+    setStatus(
+      importedAssets.length === 1
+        ? t("transport.status.clipAdded", { name: importedAssets[0].fileName })
+        : t("transport.status.clipsAdded", { count: importedAssets.length }),
+    );
+  }
+
+  function rejectExternalDrop(kind: DroppedFileClassification["kind"]) {
+    setStatus(
+      kind === "mixed"
+        ? t("transport.status.externalDropMixed")
+        : t("transport.status.externalDropUnsupported"),
+    );
+  }
+
+  function handleExternalTimelineDrop(classification: DroppedFileClassification, dropSeconds: number) {
+    setExternalDropPreview(null);
+
+    if (classification.kind === "mixed" || classification.kind === "unsupported") {
+      rejectExternalDrop(classification.kind);
+      return;
+    }
+
+    void runAction(async () => {
+      if (classification.kind === "package") {
+        if (!classification.packageFile) {
+          rejectExternalDrop("unsupported");
+          return;
+        }
+
+        await handleDroppedSongPackage(classification.packageFile, dropSeconds);
+        return;
+      }
+
+      await handleDroppedAudioFiles(classification.audioFiles, dropSeconds);
+    }, { busy: true });
+  }
+
   function handleTrackListLibraryDragLeave(event: ReactDragEvent<HTMLDivElement>) {
     const nextTarget = event.relatedTarget;
     if (nextTarget instanceof Node && event.currentTarget.contains(nextTarget)) {
@@ -5846,7 +5941,7 @@ export function TransportPanelContent() {
                 scrollViewportRef={timelineScrollViewportRef}
                 libraryClipPreview={libraryClipPreview}
                 libraryPreviewRows={libraryPreviewRows}
-                packageDropPreviewSeconds={packageDropPreviewSeconds}
+                externalDropPreview={externalDropPreview}
                 shouldShowEmptyArrangementHint={shouldShowEmptyArrangementHint}
                 normalizePositionSeconds={(positionSeconds) =>
                   normalizeTimelineSeekSeconds(positionSeconds, workspaceDurationSeconds)}
@@ -6089,42 +6184,8 @@ export function TransportPanelContent() {
                 onTrackLaneLibraryDrop={handleTrackLaneLibraryDrop}
                 onLibraryPreviewLaneDragOver={handleLibraryPreviewLaneDragOver}
                 onLibraryPreviewLaneDrop={handleLibraryPreviewLaneDrop}
-                onExternalPackageDragOver={setPackageDropPreviewSeconds}
-                onExternalPackageDragLeave={() => setPackageDropPreviewSeconds(null)}
-                onExternalPackageDrop={(file, dropSeconds) => {
-                  setPackageDropPreviewSeconds(null);
-                  setIsBusy(true);
-
-                  const reader = new FileReader();
-                  reader.onload = async (event) => {
-                    try {
-                      const dataUrl = event.target?.result;
-                      if (typeof dataUrl !== "string") {
-                        throw new Error("Failed to read the dropped package file.");
-                      }
-
-                      const base64Data = dataUrl.split(",")[1];
-                      if (!base64Data) {
-                        throw new Error("Failed to extract Base64 data from dropped file.");
-                      }
-
-                      const nextSnapshot = await importSongPackageFromBase64(base64Data, dropSeconds);
-                      applyPlaybackSnapshot(nextSnapshot);
-                      await refreshLibraryState();
-                      setStatus(t("transport.status.packageImportedAt", { time: formatClock(dropSeconds) }));
-                    } catch (error) {
-                      setStatus(formatErrorStatus(error));
-                    } finally {
-                      setIsBusy(false);
-                    }
-                  };
-                  reader.onerror = () => {
-                    setStatus(t("transport.status.error", { message: "Failed to read the dropped package file." }));
-                    setIsBusy(false);
-                  };
-
-                  reader.readAsDataURL(file);
-                }}
+                onExternalDropPreviewChange={setExternalDropPreview}
+                onExternalDrop={handleExternalTimelineDrop}
               />
             </div>
           </div>
