@@ -2136,6 +2136,7 @@ textarea {
   display: flex;
   flex-direction: column;
   gap: 0.12rem;
+  overflow: hidden;
 }
 
 .lt-track-header-summary {
@@ -2143,6 +2144,8 @@ textarea {
   flex: 1 1 auto;
   display: flex;
   align-items: stretch;
+  min-width: 0;
+  overflow: hidden;
 }
 
 .lt-track-header.is-condensed {
@@ -2263,6 +2266,8 @@ textarea {
   display: flex;
   align-items: center;
   gap: 0.25rem;
+  min-width: 0;
+  overflow: hidden;
 }
 
 .lt-track-title-row strong {
@@ -2898,6 +2903,30 @@ textarea {
 
 .lt-control-group-region .lt-control-popover-panel {
   min-width: 16rem;
+}
+
+.lt-control-group-region .lt-control-group-body {
+  align-items: stretch;
+}
+
+.lt-control-group-region .lt-control-group-details {
+  flex: 1 1 auto;
+  min-width: 0;
+  align-items: stretch;
+}
+
+.lt-control-group-region .lt-control-group-details > span {
+  white-space: normal;
+  overflow-wrap: anywhere;
+}
+
+.lt-control-group-region .lt-stepper-control {
+  width: 100%;
+  min-width: 0;
+}
+
+.lt-control-group-region .lt-stepper-control-row {
+  width: 100%;
 }
 
 .lt-control-group-song .lt-control-popover-panel {
