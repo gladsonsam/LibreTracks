@@ -548,42 +548,34 @@ fn stream_decode_from(
     pitch_engine.reset();
     let channels = source.channels.max(1);
     let latency_frames = pitch_engine.latency_frames();
+    // TRUE LOOKAHEAD PRIMING:
+    // To get output for `start_seconds` immediately, we must feed the engine
+    // with the first `latency_frames` starting from `start_seconds` and discard its output.
     if latency_frames > 0 {
-        let latency_seconds = latency_frames as f64 / output_sample_rate as f64;
-        let actual_start_seconds = (start_seconds - latency_seconds).max(0.0);
-        let frames_to_read = ((start_seconds - actual_start_seconds) * output_sample_rate as f64)
-            .round() as usize;
-        let missing_silence_frames = latency_frames.saturating_sub(frames_to_read);
-
-        if missing_silence_frames > 0 {
-            let silence_chunk_frames = STREAM_WORKER_CHUNK_FRAMES.min(missing_silence_frames);
-            let silence_chunk = vec![0.0; silence_chunk_frames * channels];
-            let mut remaining_silence_frames = missing_silence_frames;
-            while remaining_silence_frames > 0 {
-                let frames = remaining_silence_frames.min(silence_chunk_frames);
-                let samples = &silence_chunk[..frames * channels];
-                let _ = pitch_engine.process_interleaved(samples, false);
-                remaining_silence_frames -= frames;
-            }
-        }
-
-        if frames_to_read > 0 {
-            if let Ok(mut preroll_decoder) = StreamingDecoder::open(source, output_sample_rate, actual_start_seconds) {
-                let mut remaining = frames_to_read;
-                while remaining > 0 {
-                    let chunk_size = remaining.min(STREAM_WORKER_CHUNK_FRAMES);
-                    match preroll_decoder.next_output_chunk(chunk_size) {
-                        Ok(samples) if samples.is_empty() => break,
-                        Ok(samples) => {
-                            let _ = pitch_engine.process_interleaved(&samples, false);
-                            remaining = remaining.saturating_sub(samples.len() / channels);
-                        }
-                        Err(_) => break,
-                    }
+        let mut remaining_priming = latency_frames;
+        while remaining_priming > 0 {
+            let chunk_size = remaining_priming.min(STREAM_WORKER_CHUNK_FRAMES);
+            match decoder.next_output_chunk(chunk_size) {
+                Ok(samples) if samples.is_empty() => {
+                    // Hit EOF during priming (the clip is extremely short).
+                    // Feed silence to push the remaining latency out.
+                    let silence = vec![0.0; remaining_priming * channels];
+                    let _ = pitch_engine.process_interleaved(&silence, false);
+                    break;
                 }
+                Ok(samples) => {
+                    // Process the future samples and deliberately discard the output
+                    let _ = pitch_engine.process_interleaved(&samples, false);
+                    remaining_priming = remaining_priming.saturating_sub(samples.len() / channels);
+                }
+                Err(_) => break, // Handle decode errors gracefully
             }
         }
     }
+
+    // MAIN LOOP:
+    // The decoder is now naturally pointing at `start_seconds + latency`,
+    // so the engine's next outputs will correspond exactly to the timeline.
     loop {
         while let Ok(command) = command_receiver.try_recv() {
             match command {
