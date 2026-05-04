@@ -5,10 +5,10 @@ import {
   useMemo,
   useRef,
   useState,
-  type DragEvent as ReactDragEvent,
   type MouseEvent as ReactMouseEvent,
   type WheelEvent as ReactWheelEvent,
 } from "react";
+import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { useTranslation } from "react-i18next";
 import { open } from "@tauri-apps/plugin-dialog";
 import {
@@ -71,6 +71,7 @@ import {
   importLibraryAssetsFromDialog,
   importAudioFilesFromBytes,
   importAudioFilesFromPaths,
+  importSongPackage,
   importSongPackageFromBytes,
   isTauriApp,
   listenToAudioMeters,
@@ -142,6 +143,7 @@ import {
 } from "./store";
 import {
   createPendingAudioImports,
+  createPendingAudioImportsFromPaths,
   mergePendingClipsByTrack,
   nextPaint,
   toPendingLibraryAsset,
@@ -156,10 +158,10 @@ import {
   useTimelineUIStore,
 } from "./uiStore";
 import {
-  LIBRARY_ASSET_DRAG_MIME,
-  isInternalLibraryDrag,
+  classifyDroppedPaths,
   type DroppedFileClassification,
   type ExternalDropPreview,
+  type NativeDroppedPathClassification,
 } from "./dragDrop";
 
 const HEADER_WIDTH = 260;
@@ -407,6 +409,28 @@ type LibraryDragHoverState = {
   targetTrackId: string | null;
 };
 
+type InternalLibraryPointerDrag = {
+  id: string;
+  payload: LibraryAssetDragPayload[];
+  origin: {
+    x: number;
+    y: number;
+  };
+  current: {
+    x: number;
+    y: number;
+  };
+  isDragging: boolean;
+  hover:
+    | {
+        kind: "timeline";
+        dropSeconds: number;
+        targetTrackId: string | null;
+        layout: LibraryDropLayout;
+      }
+    | null;
+};
+
 type LibraryDragAutoScrollState = {
   frameId: number | null;
   horizontalVelocity: number;
@@ -442,7 +466,7 @@ function formatCompactTime(seconds: number) {
 }
 
 function libraryAssetFileName(filePath: string) {
-  return filePath.split("/").at(-1) ?? filePath;
+  return filePath.split(/[\\/]/).at(-1) ?? filePath;
 }
 
 type NativeDroppedFile = File & {
@@ -476,55 +500,18 @@ function humanizeLibraryTrackName(filePath: string) {
     .join(" ") || "Audio";
 }
 
-function readLibraryAssetDragPayload(dataTransfer: DataTransfer | null): LibraryAssetDragPayload[] | null {
-  if (!dataTransfer) {
-    return null;
-  }
-
-  const payload = dataTransfer.getData(LIBRARY_ASSET_DRAG_MIME).trim();
-  if (!payload) {
-    return null;
-  }
-
-  try {
-    const parsed = JSON.parse(payload) as Partial<LibraryAssetDragPayload> | Array<Partial<LibraryAssetDragPayload>>;
-    const items = Array.isArray(parsed) ? parsed : [parsed];
-    const normalizedPayload = items.flatMap((item) => {
-      if (
-        typeof item.file_path !== "string" ||
-        !item.file_path ||
-        typeof item.durationSeconds !== "number" ||
-        !Number.isFinite(item.durationSeconds)
-      ) {
-        return [];
-      }
-
-      return [{
-        file_path: item.file_path,
-        durationSeconds: Math.max(0.05, item.durationSeconds),
-      }];
-    });
-
-    if (!normalizedPayload.length) {
-      return null;
-    }
-
-    return normalizedPayload;
-  } catch {
-    return null;
-  }
-}
-
-function hasLibraryAssetDragType(dataTransfer: DataTransfer | null) {
-  return isInternalLibraryDrag(dataTransfer);
-}
-
-function debugLibraryDrag(..._args: Array<unknown>) {}
-
 async function waitForUiPaint() {
   await new Promise<void>((resolve) => {
     window.requestAnimationFrame(() => resolve());
   });
+}
+
+function toClientPointFromNativePosition(position: { x: number; y: number }) {
+  const scaleFactor = window.devicePixelRatio || 1;
+  return {
+    clientX: position.x / scaleFactor,
+    clientY: position.y / scaleFactor,
+  };
 }
 
 function formatMusicalPosition(seconds: number, song: SongView | null | undefined) {
@@ -889,6 +876,8 @@ export function TransportPanelContent() {
   const [libraryAssets, setLibraryAssets] = useState<LibraryAssetSummary[]>([]);
   const [libraryFolders, setLibraryFolders] = useState<string[]>([]);
   const [libraryClipPreview, setLibraryClipPreview] = useState<LibraryClipPreviewState[]>([]);
+  const [internalLibraryPointerDrag, setInternalLibraryPointerDrag] =
+    useState<InternalLibraryPointerDrag | null>(null);
   const [externalDropPreview, setExternalDropPreview] = useState<ExternalDropPreview | null>(null);
   const [selectedRegionId, setSelectedRegionId] = useState<string | null>(null);
   const selectedRegion = useMemo(
@@ -1063,6 +1052,67 @@ export function TransportPanelContent() {
         setRemoteServerInfo(null);
       });
   }, []);
+
+  useEffect(() => {
+    if (!isTauriApp) {
+      return;
+    }
+
+    if (!(window as Window & { __TAURI_INTERNALS__?: unknown }).__TAURI_INTERNALS__) {
+      return;
+    }
+
+    let disposed = false;
+    let unlisten: (() => void) | null = null;
+
+    void getCurrentWebview()
+      .onDragDropEvent((event) => {
+        if (event.type === "enter") {
+          handleNativeFileDragOver({
+            paths: event.paths,
+            position: event.position,
+          });
+          return;
+        }
+
+        if (event.type === "over") {
+          handleNativeFileDragOver({
+            position: event.position,
+          });
+          return;
+        }
+
+        if (event.type === "drop") {
+          handleNativeFileDrop({
+            paths: event.paths,
+            position: event.position,
+          });
+          return;
+        }
+
+        nativeExternalDropPathsRef.current = [];
+        setExternalDropPreview(null);
+      })
+      .then((dispose) => {
+        if (disposed) {
+          dispose();
+          return;
+        }
+
+        unlisten = dispose;
+      });
+
+    return () => {
+      disposed = true;
+      unlisten?.();
+    };
+  }, []);
+
+  useEffect(() => {
+    return () => {
+      stopInternalLibraryPointerDragListeners();
+    };
+  }, []);
   const selectedTrackIds = useTimelineUIStore((state) => state.selectedTrackIds);
   const selectedClipId = useTimelineUIStore((state) => state.selectedClipId);
   const selectedSectionId = useTimelineUIStore((state) => state.selectedSectionId);
@@ -1095,6 +1145,7 @@ export function TransportPanelContent() {
   const suppressTrackClickRef = useRef(false);
   const renderMetricTimeoutRef = useRef<number | null>(null);
   const pendingRenderMetricRef = useRef(0);
+  const nativeExternalDropPathsRef = useRef<string[]>([]);
   const transportReadoutTempoRef = useRef<HTMLElement | null>(null);
   const transportReadoutValueRef = useRef<HTMLElement | null>(null);
   const transportReadoutBarRef = useRef<HTMLElement | null>(null);
@@ -1127,6 +1178,14 @@ export function TransportPanelContent() {
   const droppedTrackRowRef = useRef<HTMLDivElement | null>(null);
   const libraryDragHoverRef = useRef<LibraryDragHoverState | null>(null);
   const activeLibraryDragPayloadRef = useRef<LibraryAssetDragPayload[] | null>(null);
+  const internalLibraryPointerDragRef = useRef<InternalLibraryPointerDrag | null>(null);
+  const internalLibraryPointerDragListenersRef = useRef<{
+    move: (event: PointerEvent) => void;
+    up: (event: PointerEvent) => void;
+    cancel: (event: PointerEvent) => void;
+    mouseMove: (event: MouseEvent) => void;
+    mouseUp: (event: MouseEvent) => void;
+  } | null>(null);
   const libraryDragAutoScrollRef = useRef<LibraryDragAutoScrollState>({
     frameId: null,
     horizontalVelocity: 0,
@@ -4934,39 +4993,6 @@ export function TransportPanelContent() {
     );
   }
 
-  function resolveLibraryDragPayload(dataTransfer: DataTransfer | null) {
-    const payload = readLibraryAssetDragPayload(dataTransfer);
-    if (payload?.length) {
-      activeLibraryDragPayloadRef.current = payload;
-      debugLibraryDrag("resolveLibraryDragPayload:from-dataTransfer", {
-        count: payload.length,
-        types: Array.from(dataTransfer?.types ?? []),
-        files: payload.map((item) => item.file_path),
-      });
-      return payload;
-    }
-
-    if (activeLibraryDragPayloadRef.current?.length) {
-      debugLibraryDrag("resolveLibraryDragPayload:from-ref", {
-        count: activeLibraryDragPayloadRef.current.length,
-        types: Array.from(dataTransfer?.types ?? []),
-      });
-      return activeLibraryDragPayloadRef.current;
-    }
-
-    if (hasLibraryAssetDragType(dataTransfer)) {
-      debugLibraryDrag("resolveLibraryDragPayload:drag-type-without-payload", {
-        types: Array.from(dataTransfer?.types ?? []),
-      });
-      return activeLibraryDragPayloadRef.current;
-    }
-
-    debugLibraryDrag("resolveLibraryDragPayload:none", {
-      types: Array.from(dataTransfer?.types ?? []),
-    });
-    return null;
-  }
-
   function resolveLibraryDropLayout(
     payload: LibraryAssetDragPayload[],
     targetTrackId: string | null,
@@ -5033,12 +5059,9 @@ export function TransportPanelContent() {
     return rulerTrackRef.current?.getBoundingClientRect() ?? element.getBoundingClientRect();
   }
 
-  function resolveLibraryDropSeconds(
-    event: ReactDragEvent<HTMLElement>,
-    element: HTMLElement,
-  ) {
+  function resolveLibraryDropSecondsAtClientX(clientX: number, element: HTMLElement) {
     const bounds = getLibraryDragViewportBounds(element);
-    const viewportX = clamp(event.clientX - bounds.left, 0, bounds.width);
+    const viewportX = clamp(clientX - bounds.left, 0, bounds.width);
     const rawSeconds = screenXToSeconds(viewportX, getCameraX(), pixelsPerSecond);
     const timingRegion = getSongTempoRegionAtPosition(song, rawSeconds);
 
@@ -5065,13 +5088,7 @@ export function TransportPanelContent() {
       hoverState.ctrlKey,
       hoverState.metaKey,
     );
-    const timelineStartSeconds = resolveLibraryDropSeconds(
-      {
-        clientX: hoverState.clientX,
-        currentTarget: element,
-      } as ReactDragEvent<HTMLElement>,
-      element,
-    );
+    const timelineStartSeconds = resolveLibraryDropSecondsAtClientX(hoverState.clientX, element);
 
     setLibraryClipPreview(
       buildLibraryClipPreview({
@@ -5105,6 +5122,10 @@ export function TransportPanelContent() {
   }
 
   function resolveTimelineDropTargetAtClientPoint(clientX: number, clientY: number) {
+    if (typeof document.elementFromPoint !== "function") {
+      return null;
+    }
+
     const target = document.elementFromPoint(clientX, clientY);
     if (!(target instanceof HTMLElement)) {
       return null;
@@ -5117,6 +5138,28 @@ export function TransportPanelContent() {
     return target.closest(
       ".lt-track-lane, .lt-track-list, .lt-track-list-dropzone, .lt-empty-arrangement-dropzone",
     ) as HTMLDivElement | null;
+  }
+
+  function resolveTimelineDropFromClientPoint(clientX: number, clientY: number) {
+    const targetElement = resolveTimelineDropTargetAtClientPoint(clientX, clientY);
+    if (!targetElement) {
+      return {
+        isOverTimeline: false,
+        dropSeconds: 0,
+        targetTrackId: null,
+      };
+    }
+
+    return {
+      isOverTimeline: true,
+      dropSeconds: resolveLibraryDropSecondsAtClientX(clientX, targetElement),
+      targetTrackId: targetElement.closest("[data-track-id]")?.getAttribute("data-track-id") ?? null,
+    };
+  }
+
+  function resolveTimelineDropFromNativePosition(position: { x: number; y: number }) {
+    const clientPoint = toClientPointFromNativePosition(position);
+    return resolveTimelineDropFromClientPoint(clientPoint.clientX, clientPoint.clientY);
   }
 
   function resolveLibraryAutoScrollVelocity(distancePx: number) {
@@ -5158,15 +5201,15 @@ export function TransportPanelContent() {
     autoScrollState.frameId = window.requestAnimationFrame(tickLibraryDragAutoScroll);
   }
 
-  function updateLibraryDragAutoScroll(event: ReactDragEvent<HTMLElement>) {
+  function updateLibraryDragAutoScrollAtClientPoint(clientX: number, clientY: number) {
     const autoScrollState = libraryDragAutoScrollRef.current;
     const horizontalBounds = rulerTrackRef.current?.getBoundingClientRect() ?? timelineShellRef.current?.getBoundingClientRect();
     const verticalBounds = timelineScrollViewportRef.current?.getBoundingClientRect();
 
     let horizontalVelocity = 0;
     if (horizontalBounds) {
-      const distanceToLeft = event.clientX - horizontalBounds.left;
-      const distanceToRight = horizontalBounds.right - event.clientX;
+      const distanceToLeft = clientX - horizontalBounds.left;
+      const distanceToRight = horizontalBounds.right - clientX;
 
       if (distanceToLeft < LIBRARY_DRAG_EDGE_BUFFER_PX) {
         horizontalVelocity = -resolveLibraryAutoScrollVelocity(distanceToLeft);
@@ -5177,8 +5220,8 @@ export function TransportPanelContent() {
 
     let verticalVelocity = 0;
     if (verticalBounds) {
-      const distanceToTop = event.clientY - verticalBounds.top;
-      const distanceToBottom = verticalBounds.bottom - event.clientY;
+      const distanceToTop = clientY - verticalBounds.top;
+      const distanceToBottom = verticalBounds.bottom - clientY;
 
       if (distanceToTop < LIBRARY_DRAG_EDGE_BUFFER_PX) {
         verticalVelocity = -resolveLibraryAutoScrollVelocity(distanceToTop);
@@ -5200,21 +5243,203 @@ export function TransportPanelContent() {
     }
   }
 
-  function beginLibraryDragHover(
-    event: ReactDragEvent<HTMLDivElement>,
-    payload: LibraryAssetDragPayload[],
-    targetTrackId: string | null,
-  ) {
+  function setInternalLibraryPointerDragState(next: InternalLibraryPointerDrag | null) {
+    internalLibraryPointerDragRef.current = next;
+    setInternalLibraryPointerDrag(next);
+  }
+
+  function stopInternalLibraryPointerDragListeners() {
+    const listeners = internalLibraryPointerDragListenersRef.current;
+    if (!listeners) {
+      return;
+    }
+
+    window.removeEventListener("pointermove", listeners.move);
+    window.removeEventListener("pointerup", listeners.up);
+    window.removeEventListener("pointercancel", listeners.cancel);
+    window.removeEventListener("mousemove", listeners.mouseMove);
+    window.removeEventListener("mouseup", listeners.mouseUp);
+    internalLibraryPointerDragListenersRef.current = null;
+  }
+
+  function clearInternalLibraryPointerDrag() {
+    stopInternalLibraryPointerDragListeners();
+    clearLibraryDragPreview();
+    clearActiveLibraryDragPayload();
+    setInternalLibraryPointerDragState(null);
+  }
+
+  function updateInternalLibraryPointerDragHover(args: {
+    drag: InternalLibraryPointerDrag;
+    clientX: number;
+    clientY: number;
+    ctrlKey: boolean;
+    metaKey: boolean;
+  }) {
+    const hit = resolveTimelineDropFromClientPoint(args.clientX, args.clientY);
+    if (!hit.isOverTimeline) {
+      clearLibraryDragPreview();
+      return {
+        ...args.drag,
+        hover: null,
+      };
+    }
+
+    const targetElement = resolveTimelineDropTargetAtClientPoint(args.clientX, args.clientY);
+    if (!targetElement) {
+      clearLibraryDragPreview();
+      return {
+        ...args.drag,
+        hover: null,
+      };
+    }
+
     libraryDragHoverRef.current = {
-      clientX: event.clientX,
-      clientY: event.clientY,
-      ctrlKey: event.ctrlKey,
-      metaKey: event.metaKey,
-      payload,
-      targetTrackId,
+      clientX: args.clientX,
+      clientY: args.clientY,
+      ctrlKey: args.ctrlKey,
+      metaKey: args.metaKey,
+      payload: args.drag.payload,
+      targetTrackId: hit.targetTrackId,
     };
-    updateLibraryClipPreview(libraryDragHoverRef.current, event.currentTarget);
-    updateLibraryDragAutoScroll(event);
+    updateLibraryClipPreview(libraryDragHoverRef.current, targetElement);
+    updateLibraryDragAutoScrollAtClientPoint(args.clientX, args.clientY);
+
+    return {
+      ...args.drag,
+      hover: {
+        kind: "timeline" as const,
+        dropSeconds: hit.dropSeconds,
+        targetTrackId: hit.targetTrackId,
+        layout: resolveLibraryDropLayout(
+          args.drag.payload,
+          hit.targetTrackId,
+          args.ctrlKey,
+          args.metaKey,
+        ),
+      },
+    };
+  }
+
+  function handleInternalLibraryPointerMove(event: PointerEvent) {
+    const drag = internalLibraryPointerDragRef.current;
+    if (!drag) {
+      return;
+    }
+
+    const hasMoved = Math.hypot(event.clientX - drag.origin.x, event.clientY - drag.origin.y) >= DRAG_THRESHOLD_PX;
+    let nextDrag: InternalLibraryPointerDrag = {
+      ...drag,
+      current: {
+        x: event.clientX,
+        y: event.clientY,
+      },
+      isDragging: drag.isDragging || hasMoved,
+    };
+
+    if (nextDrag.isDragging) {
+      nextDrag = updateInternalLibraryPointerDragHover({
+        drag: nextDrag,
+        clientX: event.clientX,
+        clientY: event.clientY,
+        ctrlKey: event.ctrlKey,
+        metaKey: event.metaKey,
+      });
+    }
+
+    setInternalLibraryPointerDragState(nextDrag);
+  }
+
+  function handleInternalLibraryPointerUp(event: PointerEvent) {
+    const drag = internalLibraryPointerDragRef.current;
+    if (!drag) {
+      return;
+    }
+
+    let nextDrag = drag;
+    if (drag.isDragging) {
+      nextDrag = updateInternalLibraryPointerDragHover({
+        drag: {
+          ...drag,
+          current: {
+            x: event.clientX,
+            y: event.clientY,
+          },
+        },
+        clientX: event.clientX,
+        clientY: event.clientY,
+        ctrlKey: event.ctrlKey,
+        metaKey: event.metaKey,
+      });
+    }
+
+    const hover = nextDrag.hover;
+    clearInternalLibraryPointerDrag();
+
+    if (!nextDrag.isDragging || !hover || hover.kind !== "timeline") {
+      return;
+    }
+
+    void runAction(async () => {
+      await placeLibraryAssetsOnTimeline({
+        payload: nextDrag.payload,
+        timelineStartSeconds: hover.dropSeconds,
+        targetTrackId: hover.targetTrackId,
+        layout: hover.layout,
+      });
+    });
+  }
+
+  function startInternalLibraryPointerDrag(args: {
+    payload: LibraryAssetDragPayload[];
+    origin: { x: number; y: number };
+    current: { x: number; y: number };
+  }) {
+    clearInternalLibraryPointerDrag();
+
+    const nextDrag: InternalLibraryPointerDrag = {
+      id:
+        typeof crypto !== "undefined" && typeof crypto.randomUUID === "function"
+          ? crypto.randomUUID()
+          : `library-pointer-drag-${Date.now()}`,
+      payload: args.payload,
+      origin: args.origin,
+      current: args.current,
+      isDragging: true,
+      hover: null,
+    };
+
+    activeLibraryDragPayloadRef.current = args.payload;
+    setInternalLibraryPointerDragState(nextDrag);
+
+    const move = (event: PointerEvent) => {
+      handleInternalLibraryPointerMove(event);
+    };
+    const up = (event: PointerEvent) => {
+      handleInternalLibraryPointerUp(event);
+    };
+    const cancel = () => {
+      clearInternalLibraryPointerDrag();
+    };
+    const mouseMove = (event: MouseEvent) => {
+      handleInternalLibraryPointerMove(event as unknown as PointerEvent);
+    };
+    const mouseUp = (event: MouseEvent) => {
+      handleInternalLibraryPointerUp(event as unknown as PointerEvent);
+    };
+
+    window.addEventListener("pointermove", move);
+    window.addEventListener("pointerup", up);
+    window.addEventListener("pointercancel", cancel);
+    window.addEventListener("mousemove", mouseMove);
+    window.addEventListener("mouseup", mouseUp);
+    internalLibraryPointerDragListenersRef.current = {
+      move,
+      up,
+      cancel,
+      mouseMove,
+      mouseUp,
+    };
   }
 
   async function createLibraryTrackForAsset(asset: LibraryAssetSummary) {
@@ -5384,6 +5609,13 @@ export function TransportPanelContent() {
     setStatus(t("transport.status.packageImportedAt", { time: formatClock(dropSeconds) }));
   }
 
+  async function handleDroppedSongPackagePath(packagePath: string, dropSeconds: number) {
+    const nextSnapshot = await importSongPackage(packagePath, dropSeconds);
+    applyPlaybackSnapshot(nextSnapshot);
+    await refreshLibraryState();
+    setStatus(t("transport.status.packageImportedAt", { time: formatClock(dropSeconds) }));
+  }
+
   async function createRealTracksAndClipsForImportedAssets(args: {
     importedAssets: LibraryAssetSummary[];
     dropSeconds: number;
@@ -5500,6 +5732,68 @@ export function TransportPanelContent() {
     });
   }
 
+  async function startDroppedAudioPathImportJob(args: {
+    paths: string[];
+    pendingImports: PendingAudioImport[];
+    dropSeconds: number;
+  }) {
+    const pendingIds = args.pendingImports.map((item) => item.id);
+
+    await nextPaint();
+
+    try {
+      useTransportStore.getState().updatePendingAudioImportStatus(pendingIds, "importing");
+
+      const importedAssets = await importAudioFilesFromPaths(
+        args.paths.map((path) => ({
+          fileName: libraryAssetFileName(path),
+          sourcePath: path,
+        })),
+      );
+
+      useTransportStore.getState().updatePendingAudioImportStatus(pendingIds, "metadata");
+      await refreshLibraryState();
+
+      useTransportStore.getState().updatePendingAudioImportStatus(pendingIds, "analyzing");
+      await createRealTracksAndClipsForImportedAssets({
+        importedAssets,
+        dropSeconds: args.dropSeconds,
+      });
+
+      useTransportStore.getState().removePendingAudioImports(pendingIds);
+      setStatus(
+        importedAssets.length === 1
+          ? t("transport.status.clipAdded", { name: importedAssets[0].fileName })
+          : t("transport.status.clipsAdded", { count: importedAssets.length }),
+      );
+    } catch (error) {
+      const message =
+        error instanceof Error
+          ? error.message
+          : "Could not import audio files. Please check the files and try again.";
+
+      useTransportStore.getState().markPendingAudioImportsFailed(pendingIds, message);
+      setStatus(message);
+    }
+  }
+
+  function handleDroppedAudioPaths(paths: string[], dropSeconds: number) {
+    const pendingImports = createPendingAudioImportsFromPaths(paths, dropSeconds);
+    useTransportStore.getState().addPendingAudioImports(pendingImports);
+
+    setStatus(
+      paths.length === 1
+        ? `Importing ${libraryAssetFileName(paths[0])}...`
+        : `Importing ${paths.length} audio files...`,
+    );
+
+    void startDroppedAudioPathImportJob({
+      paths,
+      pendingImports,
+      dropSeconds,
+    });
+  }
+
   function rejectExternalDrop(kind: DroppedFileClassification["kind"]) {
     setStatus(
       kind === "mixed"
@@ -5531,159 +5825,67 @@ export function TransportPanelContent() {
     handleDroppedAudioFiles(classification.audioFiles, dropSeconds);
   }
 
-  function handleTrackListLibraryDragLeave(event: ReactDragEvent<HTMLDivElement>) {
-    const nextTarget = event.relatedTarget;
-    if (nextTarget instanceof Node && event.currentTarget.contains(nextTarget)) {
-      return;
-    }
-
-    clearLibraryDragPreview();
-  }
-
-  function handleTrackLaneLibraryDragOver(
-    event: ReactDragEvent<HTMLDivElement>,
-    track: TrackSummary,
+  function handleNativeExternalTimelineDrop(
+    classification: NativeDroppedPathClassification,
+    dropSeconds: number,
   ) {
-    event.preventDefault();
-    const payload = resolveLibraryDragPayload(event.dataTransfer);
-    if (!payload || track.kind === "folder") {
+    setExternalDropPreview(null);
+    nativeExternalDropPathsRef.current = [];
+
+    if (classification.kind === "mixed" || classification.kind === "unsupported") {
+      rejectExternalDrop(classification.kind);
       return;
     }
 
-    event.stopPropagation();
-    event.dataTransfer.dropEffect = "copy";
-    beginLibraryDragHover(event, payload, track.id);
+    if (classification.kind === "package") {
+      void runAction(async () => {
+        await handleDroppedSongPackagePath(classification.packagePath, dropSeconds);
+      }, { busy: true });
+      return;
+    }
+
+    handleDroppedAudioPaths(classification.audioPaths, dropSeconds);
   }
 
-  function handleTrackLaneLibraryDrop(
-    event: ReactDragEvent<HTMLDivElement>,
-    track: TrackSummary,
-  ) {
-    const payload = resolveLibraryDragPayload(event.dataTransfer);
-    if (!payload || track.kind === "folder") {
+  function handleNativeFileDragOver(args: { paths?: string[]; position: { x: number; y: number } }) {
+    if (args.paths?.length) {
+      nativeExternalDropPathsRef.current = args.paths;
+    }
+
+    const paths = args.paths?.length ? args.paths : nativeExternalDropPathsRef.current;
+    if (!paths.length) {
+      setExternalDropPreview(null);
       return;
     }
 
-    event.preventDefault();
-    event.stopPropagation();
-    clearLibraryDragPreview();
-    clearActiveLibraryDragPayload();
+    const hit = resolveTimelineDropFromNativePosition(args.position);
+    if (!hit.isOverTimeline) {
+      setExternalDropPreview(null);
+      return;
+    }
 
-    void runAction(async () => {
-      await placeLibraryAssetsOnTimeline({
-        payload,
-        timelineStartSeconds: resolveLibraryDropSeconds(event, event.currentTarget),
-        targetTrackId: track.id,
-        layout: resolveLibraryDropLayout(payload, track.id, event.ctrlKey, event.metaKey),
-      });
+    const classification = classifyDroppedPaths(paths);
+    setExternalDropPreview({
+      kind: classification.kind,
+      seconds: hit.dropSeconds,
     });
   }
 
-  function handleTrackListLibraryDragOver(event: ReactDragEvent<HTMLDivElement>) {
-    event.preventDefault();
-    const payload = resolveLibraryDragPayload(event.dataTransfer);
-    if (!payload) {
+  function handleNativeFileDrop(args: { paths: string[]; position: { x: number; y: number } }) {
+    nativeExternalDropPathsRef.current = [];
+
+    if (!args.paths.length) {
+      setExternalDropPreview(null);
       return;
     }
 
-    event.stopPropagation();
-    event.dataTransfer.dropEffect = "copy";
-
-    const target = event.target instanceof HTMLElement ? event.target : null;
-    if (target?.closest(".lt-track-lane")) {
-      updateLibraryDragAutoScroll(event);
+    const hit = resolveTimelineDropFromNativePosition(args.position);
+    if (!hit.isOverTimeline) {
+      setExternalDropPreview(null);
       return;
     }
 
-    beginLibraryDragHover(event, payload, null);
-  }
-
-  function handleTrackListLibraryDrop(event: ReactDragEvent<HTMLDivElement>) {
-    const payload = resolveLibraryDragPayload(event.dataTransfer);
-    const target = event.target instanceof HTMLElement ? event.target : null;
-    if (!payload || target?.closest(".lt-track-lane")) {
-      return;
-    }
-
-    event.preventDefault();
-    event.stopPropagation();
-    clearLibraryDragPreview();
-    clearActiveLibraryDragPayload();
-
-    void runAction(async () => {
-      await placeLibraryAssetsOnTimeline({
-        payload,
-        timelineStartSeconds: resolveLibraryDropSeconds(event, event.currentTarget),
-        targetTrackId: null,
-        layout: resolveLibraryDropLayout(payload, null, event.ctrlKey, event.metaKey),
-      });
-    });
-  }
-
-  function handleLibraryPreviewLaneDragOver(event: ReactDragEvent<HTMLDivElement>) {
-    event.preventDefault();
-    const payload = resolveLibraryDragPayload(event.dataTransfer);
-    if (!payload) {
-      return;
-    }
-
-    event.stopPropagation();
-    event.dataTransfer.dropEffect = "copy";
-    beginLibraryDragHover(event, payload, null);
-  }
-
-  function handleLibraryPreviewLaneDrop(event: ReactDragEvent<HTMLDivElement>) {
-    const payload = resolveLibraryDragPayload(event.dataTransfer);
-    if (!payload) {
-      return;
-    }
-
-    event.preventDefault();
-    event.stopPropagation();
-    clearLibraryDragPreview();
-    clearActiveLibraryDragPayload();
-
-    void runAction(async () => {
-      await placeLibraryAssetsOnTimeline({
-        payload,
-        timelineStartSeconds: resolveLibraryDropSeconds(event, event.currentTarget),
-        targetTrackId: null,
-        layout: resolveLibraryDropLayout(payload, null, event.ctrlKey, event.metaKey),
-      });
-    });
-  }
-
-  function handleEmptyArrangementLibraryDragOver(event: ReactDragEvent<HTMLDivElement>) {
-    event.preventDefault();
-    const payload = resolveLibraryDragPayload(event.dataTransfer);
-    if (!payload) {
-      return;
-    }
-
-    event.stopPropagation();
-    event.dataTransfer.dropEffect = "copy";
-    beginLibraryDragHover(event, payload, null);
-  }
-
-  function handleEmptyArrangementLibraryDrop(event: ReactDragEvent<HTMLDivElement>) {
-    const payload = resolveLibraryDragPayload(event.dataTransfer);
-    if (!payload) {
-      return;
-    }
-
-    event.preventDefault();
-    event.stopPropagation();
-    clearLibraryDragPreview();
-    clearActiveLibraryDragPayload();
-
-    void runAction(async () => {
-      await placeLibraryAssetsOnTimeline({
-        payload,
-        timelineStartSeconds: resolveLibraryDropSeconds(event, event.currentTarget),
-        targetTrackId: null,
-        layout: resolveLibraryDropLayout(payload, null, event.ctrlKey, event.metaKey),
-      });
-    });
+    handleNativeExternalTimelineDrop(classifyDroppedPaths(args.paths), hit.dropSeconds);
   }
 
   const selectedAudioOutputDevice = appSettings.selectedOutputDevice ?? "";
@@ -5898,13 +6100,7 @@ export function TransportPanelContent() {
           deletingFilePath={deletingLibraryFilePath}
           canImport={Boolean(playbackSongDir)}
           onLocateAsset={handleLocateMissingFile}
-          onDragAssetsStart={(payload) => {
-            activeLibraryDragPayloadRef.current = payload;
-          }}
-          onDragAssetsEnd={() => {
-            clearLibraryDragPreview();
-            clearActiveLibraryDragPayload();
-          }}
+          onPointerDragStart={startInternalLibraryPointerDrag}
           onImport={() => {
             void handleImportLibraryAssetsClick();
           }}
@@ -5924,6 +6120,34 @@ export function TransportPanelContent() {
             void handleDeleteLibraryAssets(assets);
           }}
         />
+      ) : null}
+      {internalLibraryPointerDrag?.isDragging ? (
+        <div
+          aria-hidden="true"
+          style={{
+            position: "fixed",
+            left: internalLibraryPointerDrag.current.x + 18,
+            top: internalLibraryPointerDrag.current.y + 18,
+            zIndex: 9999,
+            pointerEvents: "none",
+            padding: "10px 12px",
+            borderRadius: 12,
+            background: "rgba(14, 18, 28, 0.92)",
+            border: "1px solid rgba(138, 161, 255, 0.35)",
+            boxShadow: "0 16px 40px rgba(0, 0, 0, 0.28)",
+            color: "#f5f7ff",
+            minWidth: 160,
+          }}
+        >
+          <strong style={{ display: "block", fontSize: 12, marginBottom: 4 }}>
+            {internalLibraryPointerDrag.payload.length === 1
+              ? libraryAssetFileName(internalLibraryPointerDrag.payload[0].file_path)
+              : `${internalLibraryPointerDrag.payload.length} assets`}
+          </strong>
+          <span style={{ display: "block", fontSize: 11, opacity: 0.76 }}>
+            Drop on timeline to place clip{internalLibraryPointerDrag.payload.length === 1 ? "" : "s"}
+          </span>
+        </div>
       ) : null}
       {shouldShowEmptyState ? (
         <div className="lt-empty-state">
@@ -6283,17 +6507,8 @@ export function TransportPanelContent() {
                   });
                 }}
                 onTrackListContextMenu={handleTrackListContextMenu}
-                onTrackListLibraryDragOver={handleTrackListLibraryDragOver}
-                onTrackListLibraryDrop={handleTrackListLibraryDrop}
-                onTrackListLibraryDragLeave={handleTrackListLibraryDragLeave}
-                onEmptyArrangementLibraryDragOver={handleEmptyArrangementLibraryDragOver}
-                onEmptyArrangementLibraryDrop={handleEmptyArrangementLibraryDrop}
                 onTrackLaneMouseDown={handleTrackLaneMouseDown}
                 onTrackLaneContextMenu={handleTrackLaneContextMenu}
-                onTrackLaneLibraryDragOver={handleTrackLaneLibraryDragOver}
-                onTrackLaneLibraryDrop={handleTrackLaneLibraryDrop}
-                onLibraryPreviewLaneDragOver={handleLibraryPreviewLaneDragOver}
-                onLibraryPreviewLaneDrop={handleLibraryPreviewLaneDrop}
                 onExternalDropPreviewChange={setExternalDropPreview}
                 onExternalDrop={handleExternalTimelineDrop}
               />

@@ -1,9 +1,4 @@
-import type {
-  DragEvent as ReactDragEvent,
-  MouseEvent as ReactMouseEvent,
-  MutableRefObject,
-  RefObject,
-} from "react";
+import type { DragEvent as ReactDragEvent, MouseEvent as ReactMouseEvent, MutableRefObject, RefObject } from "react";
 import { useTranslation } from "react-i18next";
 
 import { TimelineRulerCanvas, TimelineTrackCanvas } from "./CanvasTimeline";
@@ -117,11 +112,6 @@ type TimelineCanvasPaneProps = {
   onPreviewPositionChange: (positionSeconds: number) => void;
   onPlayheadSeekCommit: (positionSeconds: number) => void;
   onTrackListContextMenu: (event: ReactMouseEvent<HTMLDivElement>) => void;
-  onTrackListLibraryDragOver: (event: ReactDragEvent<HTMLDivElement>) => void;
-  onTrackListLibraryDrop: (event: ReactDragEvent<HTMLDivElement>) => void;
-  onTrackListLibraryDragLeave: (event: ReactDragEvent<HTMLDivElement>) => void;
-  onEmptyArrangementLibraryDragOver: (event: ReactDragEvent<HTMLDivElement>) => void;
-  onEmptyArrangementLibraryDrop: (event: ReactDragEvent<HTMLDivElement>) => void;
   onTrackLaneMouseDown: (
     event: ReactMouseEvent<HTMLDivElement>,
     track: TimelineTrackSummary,
@@ -132,10 +122,6 @@ type TimelineCanvasPaneProps = {
     track: TimelineTrackSummary,
     trackClips: ClipSummary[],
   ) => void;
-  onTrackLaneLibraryDragOver: (event: ReactDragEvent<HTMLDivElement>, track: TimelineTrackSummary) => void;
-  onTrackLaneLibraryDrop: (event: ReactDragEvent<HTMLDivElement>, track: TimelineTrackSummary) => void;
-  onLibraryPreviewLaneDragOver: (event: ReactDragEvent<HTMLDivElement>) => void;
-  onLibraryPreviewLaneDrop: (event: ReactDragEvent<HTMLDivElement>) => void;
   onExternalDropPreviewChange: (preview: ExternalDropPreview | null) => void;
   onExternalDrop: (classification: DroppedFileClassification, seconds: number) => void;
 };
@@ -191,17 +177,8 @@ export function TimelineCanvasPane({
   onPreviewPositionChange,
   onPlayheadSeekCommit,
   onTrackListContextMenu,
-  onTrackListLibraryDragOver,
-  onTrackListLibraryDrop,
-  onTrackListLibraryDragLeave,
-  onEmptyArrangementLibraryDragOver,
-  onEmptyArrangementLibraryDrop,
   onTrackLaneMouseDown,
   onTrackLaneContextMenu,
-  onTrackLaneLibraryDragOver,
-  onTrackLaneLibraryDrop,
-  onLibraryPreviewLaneDragOver,
-  onLibraryPreviewLaneDrop,
   onExternalDropPreviewChange,
   onExternalDrop,
 }: TimelineCanvasPaneProps) {
@@ -482,9 +459,6 @@ export function TimelineCanvasPane({
         ref={laneAreaRef}
         onContextMenu={onTrackListContextMenu}
         onDragEnter={handleTimelineDragEnter}
-        onDragOver={onTrackListLibraryDragOver}
-        onDrop={onTrackListLibraryDrop}
-        onDragLeave={onTrackListLibraryDragLeave}
       >
         {externalDropPreview !== null ? (
           <div
@@ -604,8 +578,6 @@ export function TimelineCanvasPane({
               className="lt-empty-arrangement-dropzone"
               aria-label={t("transport.shell.emptyArrangementDropzone")}
               onDragEnter={handleTimelineDragEnter}
-              onDragOver={onEmptyArrangementLibraryDragOver}
-              onDrop={onEmptyArrangementLibraryDrop}
             >
               <strong>{t("transport.shell.emptyArrangementTitle")}</strong>
               <p>
@@ -657,16 +629,6 @@ export function TimelineCanvasPane({
                       onTrackLaneContextMenu(event, track, trackClips);
                     }
                   }}
-                  onDragOver={(event) => {
-                    if (!isPendingTrack) {
-                      onTrackLaneLibraryDragOver(event, track);
-                    }
-                  }}
-                  onDrop={(event) => {
-                    if (!isPendingTrack) {
-                      onTrackLaneLibraryDrop(event, track);
-                    }
-                  }}
                 >
                   {libraryClipPreview
                     .filter((preview) => preview.trackId === track.id)
@@ -699,8 +661,6 @@ export function TimelineCanvasPane({
                     style={{ height: trackHeight }}
                     aria-label={`Preview lane ${previewRow.title}`}
                     onDragEnter={handleTimelineDragEnter}
-                    onDragOver={onLibraryPreviewLaneDragOver}
-                    onDrop={onLibraryPreviewLaneDrop}
                   >
                     {previewRow.previews.map((preview) => (
                       <div
@@ -724,9 +684,6 @@ export function TimelineCanvasPane({
               className="lt-track-list-dropzone"
               aria-label="Dropzone para nuevas pistas"
               onDragEnter={handleTimelineDragEnter}
-              onDragOver={onTrackListLibraryDragOver}
-              onDrop={onTrackListLibraryDrop}
-              onDragLeave={onTrackListLibraryDragLeave}
             />
           ) : null}
         </div>

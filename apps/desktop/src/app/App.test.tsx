@@ -13,6 +13,28 @@ import {
 import { App } from "./App";
 import { emitWaveformReadyForTest, resetTestDesktopApiMock, testDesktopApiMock } from "./testDesktopApiMock";
 
+type MockWebviewDragDropEvent =
+  | { type: "enter"; paths: string[]; position: { x: number; y: number } }
+  | { type: "over"; position: { x: number; y: number } }
+  | { type: "drop"; paths: string[]; position: { x: number; y: number } }
+  | { type: "leave" };
+
+let nativeDragDropHandler: ((event: MockWebviewDragDropEvent) => void) | null = null;
+const originalPointerEvent = window.PointerEvent;
+
+vi.mock("@tauri-apps/api/webview", () => ({
+  getCurrentWebview: () => ({
+    onDragDropEvent: async (handler: (event: MockWebviewDragDropEvent) => void) => {
+      nativeDragDropHandler = handler;
+      return () => {
+        if (nativeDragDropHandler === handler) {
+          nativeDragDropHandler = null;
+        }
+      };
+    },
+  }),
+}));
+
 vi.mock("../features/transport/desktopApi", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../features/transport/desktopApi")>();
   const { testDesktopApiMock } = await import("./testDesktopApiMock");
@@ -154,6 +176,11 @@ async function chooseSongJumpTrigger(triggerLabel: string) {
 }
 
 beforeEach(async () => {
+  nativeDragDropHandler = null;
+  Object.defineProperty(window, "PointerEvent", {
+    configurable: true,
+    value: originalPointerEvent,
+  });
   resetTestDesktopApiMock();
   useTransportStore.setState({
     meters: {},
@@ -177,10 +204,33 @@ beforeEach(async () => {
 });
 
 afterEach(() => {
+  Reflect.deleteProperty(window, "__TAURI_INTERNALS__");
   cleanup();
 });
 
-const LIBRARY_ASSET_DRAG_MIME = "application/libretracks-library-assets";
+function enableMockTauriInternals() {
+  Object.defineProperty(window, "__TAURI_INTERNALS__", {
+    configurable: true,
+    value: { mock: true },
+  });
+}
+
+function disablePointerEventSupport() {
+  Object.defineProperty(window, "PointerEvent", {
+    configurable: true,
+    value: undefined,
+  });
+}
+
+async function emitNativeDropEvent(event: MockWebviewDragDropEvent) {
+  await waitFor(() => {
+    expect(nativeDragDropHandler).toBeTruthy();
+  });
+
+  await act(async () => {
+    nativeDragDropHandler?.(event);
+  });
+}
 
 function createFileList(files: File[]) {
   return {
@@ -309,6 +359,8 @@ function mockLaneBounds(container: HTMLElement, width = 1140) {
 function mockTrackListBounds(container: HTMLElement, width = 1400, height = 500) {
   const trackList = container.querySelector(".lt-track-list") as HTMLDivElement | null;
   expect(trackList).toBeTruthy();
+  const rows = Array.from(container.querySelectorAll(".lt-track-lane-row")) as HTMLDivElement[];
+  const headerRows = Array.from(container.querySelectorAll(".lt-track-header-row")) as HTMLDivElement[];
 
   Object.defineProperty(trackList, "getBoundingClientRect", {
     configurable: true,
@@ -329,6 +381,22 @@ function mockTrackListBounds(container: HTMLElement, width = 1400, height = 500)
     configurable: true,
     writable: true,
     value: 0,
+  });
+
+  Object.defineProperty(document, "elementFromPoint", {
+    configurable: true,
+    value: vi.fn((x: number, y: number) => {
+      const rowIndex = rows.findIndex((_, index) => {
+        const top = 120 + index * 84;
+        return y >= top && y <= top + 78;
+      });
+
+      if (rowIndex < 0) {
+        return null;
+      }
+
+      return x < 260 ? headerRows[rowIndex] ?? rows[rowIndex] ?? null : rows[rowIndex] ?? headerRows[rowIndex] ?? null;
+    }),
   });
 }
 
@@ -501,7 +569,8 @@ describe("App", () => {
     expect(screen.getByRole("slider", { name: textMatcher(interpolate(en.trackHeader.volumeAria, { name: "Drums" })) })).toBeTruthy();
   });
 
-  it("shows library assets and exposes the drag payload for timeline drops", async () => {
+  it("shows library assets and starts a pointer drag ghost for timeline drops", async () => {
+    disablePointerEventSupport();
     await renderApp();
 
     await act(async () => {
@@ -511,30 +580,30 @@ describe("App", () => {
     expect(screen.getByText("drums.wav")).toBeTruthy();
     expect(screen.getByText("bass.wav")).toBeTruthy();
 
-    const transferData = new Map<string, string>();
-    const dataTransfer = {
-      effectAllowed: "",
-      setData: vi.fn((type: string, value: string) => {
-        transferData.set(type, value);
-      }),
-      getData: vi.fn((type: string) => transferData.get(type) ?? ""),
-    };
-
     await act(async () => {
-      fireEvent.dragStart(getLibraryAssetButton("drums.wav"), { dataTransfer });
+      fireEvent.mouseDown(getLibraryAssetButton("drums.wav"), {
+        button: 0,
+        clientX: 90,
+        clientY: 210,
+      });
+      fireEvent.mouseMove(window, {
+        clientX: 130,
+        clientY: 250,
+      });
     });
 
-    expect(dataTransfer.effectAllowed).toBe("copyMove");
-    expect(dataTransfer.setData).toHaveBeenCalledTimes(2);
-    expect(JSON.parse(transferData.get(LIBRARY_ASSET_DRAG_MIME) ?? "[]")).toEqual([
-      {
-        file_path: "audio/drums.wav",
-        durationSeconds: 180,
-      },
-    ]);
+    expect(screen.getByText("Drop on timeline to place clip")).toBeTruthy();
+
+    await act(async () => {
+      fireEvent.mouseUp(window, {
+        clientX: 130,
+        clientY: 250,
+      });
+    });
   });
 
-  it("emits a multi-asset drag payload from the current library selection", async () => {
+  it("starts a multi-asset pointer drag from the current library selection", async () => {
+    disablePointerEventSupport();
     await renderApp();
 
     await act(async () => {
@@ -548,32 +617,31 @@ describe("App", () => {
 
     expect(screen.getByText("2 selected")).toBeTruthy();
 
-    const transferData = new Map<string, string>();
-    const dataTransfer = {
-      effectAllowed: "",
-      setData: vi.fn((type: string, value: string) => {
-        transferData.set(type, value);
-      }),
-    };
-
     await act(async () => {
-      fireEvent.dragStart(getLibraryAssetButton("drums.wav"), { dataTransfer });
+      fireEvent.mouseDown(getLibraryAssetButton("drums.wav"), {
+        button: 0,
+        clientX: 90,
+        clientY: 210,
+      });
+      fireEvent.mouseMove(window, {
+        clientX: 138,
+        clientY: 258,
+      });
     });
 
-    expect(dataTransfer.effectAllowed).toBe("copyMove");
-    expect(JSON.parse(transferData.get(LIBRARY_ASSET_DRAG_MIME) ?? "[]")).toEqual([
-      {
-        file_path: "audio/bass.wav",
-        durationSeconds: 164,
-      },
-      {
-        file_path: "audio/drums.wav",
-        durationSeconds: 180,
-      },
-    ]);
+    expect(screen.getByText("2 assets")).toBeTruthy();
+    expect(screen.getByText("Drop on timeline to place clips")).toBeTruthy();
+
+    await act(async () => {
+      fireEvent.mouseUp(window, {
+        clientX: 138,
+        clientY: 258,
+      });
+    });
   });
 
-  it("drops a library asset onto a track lane and creates a new clip", async () => {
+  it("drops a library asset onto a track lane and creates a new clip without dataTransfer", async () => {
+    disablePointerEventSupport();
     const { container } = await renderApp();
     mockRulerBounds(container);
     mockLaneBounds(container);
@@ -583,35 +651,25 @@ describe("App", () => {
       fireEvent.click(screen.getByRole("button", { name: /library/i }));
     });
 
-    const transferData = new Map<string, string>();
-    const dataTransfer = {
-      effectAllowed: "",
-      dropEffect: "",
-      setData: vi.fn((type: string, value: string) => {
-        transferData.set(type, value);
-      }),
-      getData: vi.fn((type: string) => transferData.get(type) ?? ""),
-    };
-
-    await act(async () => {
-      fireEvent.dragStart(getLibraryAssetButton("drums.wav"), { dataTransfer });
-    });
-
     const drumsRow = getTrackLaneRow(container, "Drums");
     expect(drumsRow).toBeTruthy();
-    const drumsLane = drumsRow?.querySelector(".lt-track-lane") as HTMLElement | null;
-    expect(drumsLane).toBeTruthy();
 
     await act(async () => {
-      fireEvent.dragOver(drumsLane as HTMLElement, { dataTransfer, clientX: 420, clientY: 160 });
-      fireEvent.drop(drumsLane as HTMLElement, { dataTransfer, clientX: 420, clientY: 160 });
+      fireEvent.mouseDown(getLibraryAssetButton("drums.wav"), {
+        button: 0,
+        clientX: 90,
+        clientY: 210,
+      });
+      fireEvent.mouseMove(window, { clientX: 420, clientY: 160 });
+      fireEvent.mouseUp(window, { clientX: 420, clientY: 160 });
     });
 
     expect(await screen.findByText(clipAddedMatcher("drums.wav"))).toBeTruthy();
     expect(screen.getByText(interpolate(en.timelineToolbar.clipsCount, { count: 5 }))).toBeTruthy();
   });
 
-  it("accepts library drags when the browser exposes only MIME types during hover", async () => {
+  it("updates the timeline preview during pointer drag and clears it when cancelled", async () => {
+    disablePointerEventSupport();
     const { container } = await renderApp();
     mockRulerBounds(container);
     mockLaneBounds(container);
@@ -621,114 +679,29 @@ describe("App", () => {
       fireEvent.click(screen.getByRole("button", { name: textMatcher(en.transport.shell.library) }));
     });
 
-    const transferData = new Map<string, string>();
-    const dataTransfer = {
-      effectAllowed: "",
-      dropEffect: "",
-      types: [LIBRARY_ASSET_DRAG_MIME],
-      setData: vi.fn((type: string, value: string) => {
-        transferData.set(type, value);
-      }),
-      getData: vi.fn(() => ""),
-    };
-
-    await act(async () => {
-      fireEvent.dragStart(getLibraryAssetButton("drums.wav"), { dataTransfer });
-    });
-
     const drumsRow = getTrackLaneRow(container, "Drums");
     expect(drumsRow).toBeTruthy();
-    const drumsLane = drumsRow?.querySelector(".lt-track-lane") as HTMLElement | null;
-    expect(drumsLane).toBeTruthy();
 
     await act(async () => {
-      fireEvent.dragOver(drumsLane as HTMLElement, { dataTransfer, clientX: 420, clientY: 160 });
-      fireEvent.drop(drumsLane as HTMLElement, { dataTransfer, clientX: 420, clientY: 160 });
+      fireEvent.mouseDown(getLibraryAssetButton("drums.wav"), {
+        button: 0,
+        clientX: 90,
+        clientY: 210,
+      });
+      fireEvent.mouseMove(window, { clientX: 420, clientY: 160 });
     });
 
-    expect(await screen.findByText(clipAddedMatcher("drums.wav"))).toBeTruthy();
-    expect(screen.getByText(interpolate(en.timelineToolbar.clipsCount, { count: 5 }))).toBeTruthy();
-  });
-
-  it("accepts library drags when the runtime exposes only text/plain during hover", async () => {
-    const { container } = await renderApp();
-    mockRulerBounds(container);
-    mockLaneBounds(container);
-    mockTrackListBounds(container);
+    expect(container.querySelectorAll(".lt-library-clip-ghost").length).toBeGreaterThan(0);
 
     await act(async () => {
-      fireEvent.click(screen.getByRole("button", { name: textMatcher(en.transport.shell.library) }));
+      fireEvent.mouseUp(window, { clientX: 420, clientY: 160 });
     });
 
-    const transferData = new Map<string, string>();
-    const dataTransfer = {
-      effectAllowed: "",
-      dropEffect: "",
-      types: ["text/plain"],
-      setData: vi.fn((type: string, value: string) => {
-        transferData.set(type, value);
-      }),
-      getData: vi.fn((type: string) => (type === "text/plain" ? transferData.get(type) ?? "" : "")),
-    };
-
-    await act(async () => {
-      fireEvent.dragStart(getLibraryAssetButton("drums.wav"), { dataTransfer });
-    });
-
-    const drumsRow = getTrackLaneRow(container, "Drums");
-    expect(drumsRow).toBeTruthy();
-    const drumsLane = drumsRow?.querySelector(".lt-track-lane") as HTMLElement | null;
-    expect(drumsLane).toBeTruthy();
-
-    await act(async () => {
-      fireEvent.dragOver(drumsLane as HTMLElement, { dataTransfer, clientX: 420, clientY: 160 });
-      fireEvent.drop(drumsLane as HTMLElement, { dataTransfer, clientX: 420, clientY: 160 });
-    });
-
-    expect(await screen.findByText(clipAddedMatcher("drums.wav"))).toBeTruthy();
-    expect(screen.getByText(interpolate(en.timelineToolbar.clipsCount, { count: 5 }))).toBeTruthy();
-  });
-
-  it("accepts library drags when the runtime strips both payload and MIME types during hover", async () => {
-    const { container } = await renderApp();
-    mockRulerBounds(container);
-    mockLaneBounds(container);
-    mockTrackListBounds(container);
-
-    await act(async () => {
-      fireEvent.click(screen.getByRole("button", { name: textMatcher(en.transport.shell.library) }));
-    });
-
-    const dragStartTransfer = {
-      effectAllowed: "",
-      setData: vi.fn(),
-    };
-
-    await act(async () => {
-      fireEvent.dragStart(getLibraryAssetButton("drums.wav"), { dataTransfer: dragStartTransfer });
-    });
-
-    const hoverTransfer = {
-      dropEffect: "",
-      getData: vi.fn(() => ""),
-      types: [],
-    };
-
-    const drumsRow = getTrackLaneRow(container, "Drums");
-    expect(drumsRow).toBeTruthy();
-    const drumsLane = drumsRow?.querySelector(".lt-track-lane") as HTMLElement | null;
-    expect(drumsLane).toBeTruthy();
-
-    await act(async () => {
-      fireEvent.dragOver(drumsLane as HTMLElement, { dataTransfer: hoverTransfer, clientX: 420, clientY: 160 });
-      fireEvent.drop(drumsLane as HTMLElement, { dataTransfer: hoverTransfer, clientX: 420, clientY: 160 });
-    });
-
-    expect(await screen.findByText(clipAddedMatcher("drums.wav"))).toBeTruthy();
-    expect(screen.getByText(interpolate(en.timelineToolbar.clipsCount, { count: 5 }))).toBeTruthy();
+    expect(container.querySelector(".lt-library-clip-ghost")).toBeNull();
   });
 
   it("clears stale library clip ghosts after deleting a track", async () => {
+    disablePointerEventSupport();
     const confirmSpy = vi.spyOn(window, "confirm").mockReturnValue(true);
     const { container } = await renderApp();
     mockRulerBounds(container);
@@ -739,27 +712,16 @@ describe("App", () => {
       fireEvent.click(screen.getByRole("button", { name: textMatcher(en.transport.shell.library) }));
     });
 
-    const transferData = new Map<string, string>();
-    const dataTransfer = {
-      effectAllowed: "",
-      dropEffect: "",
-      setData: vi.fn((type: string, value: string) => {
-        transferData.set(type, value);
-      }),
-      getData: vi.fn((type: string) => transferData.get(type) ?? ""),
-    };
-
-    await act(async () => {
-      fireEvent.dragStart(getLibraryAssetButton("drums.wav"), { dataTransfer });
-    });
-
     const drumsRow = getTrackLaneRow(container, "Drums");
     expect(drumsRow).toBeTruthy();
-    const drumsLane = drumsRow?.querySelector(".lt-track-lane") as HTMLElement | null;
-    expect(drumsLane).toBeTruthy();
 
     await act(async () => {
-      fireEvent.dragOver(drumsLane as HTMLElement, { dataTransfer, clientX: 420, clientY: 160 });
+      fireEvent.mouseDown(getLibraryAssetButton("drums.wav"), {
+        button: 0,
+        clientX: 90,
+        clientY: 210,
+      });
+      fireEvent.mouseMove(window, { clientX: 420, clientY: 160 });
     });
 
     expect(container.querySelectorAll(".lt-library-clip-ghost").length).toBeGreaterThan(0);
@@ -781,45 +743,38 @@ describe("App", () => {
   });
 
   it("drops multiple library assets with the vertical modifier and creates stacked tracks and clips", async () => {
+    disablePointerEventSupport();
     const { container } = await renderApp();
     mockRulerBounds(container);
     mockLaneBounds(container);
     mockTrackListBounds(container);
 
-    const transferData = new Map<string, string>();
-    transferData.set(
-      LIBRARY_ASSET_DRAG_MIME,
-      JSON.stringify([
-        {
-          file_path: "audio/drums.wav",
-          durationSeconds: 180,
-        },
-        {
-          file_path: "audio/bass.wav",
-          durationSeconds: 160,
-        },
-      ]),
-    );
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: textMatcher(en.transport.shell.library) }));
+    });
 
-    const dataTransfer = {
-      dropEffect: "",
-      getData: vi.fn((type: string) => transferData.get(type) ?? ""),
-    };
+    await screen.findByText("drums.wav");
+
+    await act(async () => {
+      fireEvent.click(getLibraryAssetButton("drums.wav"));
+      fireEvent.click(getLibraryAssetButton("bass.wav"), { ctrlKey: true });
+    });
 
     const drumsRow = getTrackLaneRow(container, "Drums");
     expect(drumsRow).toBeTruthy();
-    const drumsLane = drumsRow?.querySelector(".lt-track-lane") as HTMLElement | null;
-    expect(drumsLane).toBeTruthy();
 
     await act(async () => {
-      fireEvent.dragOver(drumsLane as HTMLElement, {
-        dataTransfer,
+      fireEvent.mouseDown(getLibraryAssetButton("drums.wav"), {
+        button: 0,
+        clientX: 90,
+        clientY: 210,
+      });
+      fireEvent.mouseMove(window, {
         clientX: 420,
         clientY: 160,
         ctrlKey: true,
       });
-      fireEvent.drop(drumsLane as HTMLElement, {
-        dataTransfer,
+      fireEvent.mouseUp(window, {
         clientX: 420,
         clientY: 160,
         ctrlKey: true,
@@ -918,33 +873,48 @@ describe("App", () => {
     });
   });
 
-  it("uses native file paths for external audio drops when available", async () => {
+  it("uses native file paths for external audio drops without reading file bytes", async () => {
     const desktopApi = await import("../features/transport/desktopApi");
     const importAudioFilesFromPathsMock = vi.mocked(desktopApi.importAudioFilesFromPaths);
     const importAudioFilesFromBytesMock = vi.mocked(desktopApi.importAudioFilesFromBytes);
+    const arrayBufferSpy = vi.fn(async () => new ArrayBuffer(0));
+    Object.defineProperty(File.prototype, "arrayBuffer", {
+      configurable: true,
+      value: arrayBufferSpy,
+    });
+    let releaseImport: (() => void) | null = null;
+    const importGate = new Promise<void>((resolve) => {
+      releaseImport = resolve;
+    });
+    importAudioFilesFromPathsMock.mockImplementationOnce(async (files) => {
+      await importGate;
+      return testDesktopApiMock.importAudioFilesFromPaths(files);
+    });
+
+    enableMockTauriInternals();
+
     const { container } = await renderApp();
     mockRulerBounds(container);
     mockLaneBounds(container);
     mockTrackListBounds(container);
     mockTimelinePaneBounds(container);
 
-    const timelinePane = container.querySelector(".lt-timeline-canvas-pane") as HTMLElement | null;
-    expect(timelinePane).toBeTruthy();
-
-    const leadFile = attachNativePath(
-      createTestFile("lead.wav", [1, 2, 3], "audio/wav"),
-      "C:/mock/imports/lead.wav",
-    );
-    const padFile = attachNativePath(
-      createTestFile("pad.mp3", [4, 5, 6], "audio/mpeg"),
-      "C:/mock/imports/pad.mp3",
-    );
-    const dataTransfer = createExternalFileDataTransfer([leadFile, padFile]);
-
     await act(async () => {
-      fireEvent.dragOver(timelinePane as HTMLElement, { dataTransfer, clientX: 420, clientY: 180 });
-      fireEvent.drop(timelinePane as HTMLElement, { dataTransfer, clientX: 420, clientY: 180 });
+      await emitNativeDropEvent({
+        type: "enter",
+        paths: ["C:/mock/imports/lead.wav", "C:/mock/imports/pad.mp3"],
+        position: { x: 420, y: 180 },
+      });
+      await emitNativeDropEvent({
+        type: "drop",
+        paths: ["C:/mock/imports/lead.wav", "C:/mock/imports/pad.mp3"],
+        position: { x: 420, y: 180 },
+      });
     });
+
+    expect(screen.getByText("lead.wav")).toBeTruthy();
+    expect(screen.getByText("pad.mp3")).toBeTruthy();
+    expect(useTransportStore.getState().pendingAudioImports).toHaveLength(2);
 
     await waitFor(() => {
       expect(importAudioFilesFromPathsMock).toHaveBeenCalledWith([
@@ -952,7 +922,19 @@ describe("App", () => {
         { fileName: "pad.mp3", sourcePath: "C:/mock/imports/pad.mp3" },
       ]);
     });
+
     expect(importAudioFilesFromBytesMock).not.toHaveBeenCalled();
+    expect(arrayBufferSpy).not.toHaveBeenCalled();
+
+    await act(async () => {
+      releaseImport?.();
+    });
+
+    expect(await screen.findByText(textMatcher(interpolate(en.transport.status.clipsAdded, { count: 2 })))).toBeTruthy();
+    expect(importAudioFilesFromBytesMock).not.toHaveBeenCalled();
+    await waitFor(() => {
+      expect(useTransportStore.getState().pendingAudioImports).toHaveLength(0);
+    });
   });
 
   it("marks pending external audio imports as failed when the import rejects", async () => {
@@ -982,45 +964,48 @@ describe("App", () => {
   });
 
   it("rejects mixed external drops", async () => {
+    enableMockTauriInternals();
     const { container } = await renderApp();
     mockRulerBounds(container);
     mockLaneBounds(container);
     mockTrackListBounds(container);
     mockTimelinePaneBounds(container);
 
-    const timelinePane = container.querySelector(".lt-timeline-canvas-pane") as HTMLElement | null;
-    expect(timelinePane).toBeTruthy();
-
-    const dataTransfer = createExternalFileDataTransfer([
-      createTestFile("session.ltpkg", [1]),
-      createTestFile("lead.wav", [2], "audio/wav"),
-    ]);
-
     await act(async () => {
-      fireEvent.dragOver(timelinePane as HTMLElement, { dataTransfer, clientX: 420, clientY: 180 });
-      fireEvent.drop(timelinePane as HTMLElement, { dataTransfer, clientX: 420, clientY: 180 });
+      await emitNativeDropEvent({
+        type: "enter",
+        paths: ["C:/mock/imports/session.ltpkg", "C:/mock/imports/lead.wav"],
+        position: { x: 420, y: 180 },
+      });
+      await emitNativeDropEvent({
+        type: "drop",
+        paths: ["C:/mock/imports/session.ltpkg", "C:/mock/imports/lead.wav"],
+        position: { x: 420, y: 180 },
+      });
     });
 
     expect(await screen.findByText(textMatcher(en.transport.status.externalDropMixed))).toBeTruthy();
   });
 
   it("rejects unsupported external drops", async () => {
+    enableMockTauriInternals();
     const { container } = await renderApp();
     mockRulerBounds(container);
     mockLaneBounds(container);
     mockTrackListBounds(container);
     mockTimelinePaneBounds(container);
 
-    const timelinePane = container.querySelector(".lt-timeline-canvas-pane") as HTMLElement | null;
-    expect(timelinePane).toBeTruthy();
-
-    const dataTransfer = createExternalFileDataTransfer([
-      createTestFile("notes.txt", [1], "text/plain"),
-    ]);
-
     await act(async () => {
-      fireEvent.dragOver(timelinePane as HTMLElement, { dataTransfer, clientX: 420, clientY: 180 });
-      fireEvent.drop(timelinePane as HTMLElement, { dataTransfer, clientX: 420, clientY: 180 });
+      await emitNativeDropEvent({
+        type: "enter",
+        paths: ["C:/mock/imports/notes.txt"],
+        position: { x: 420, y: 180 },
+      });
+      await emitNativeDropEvent({
+        type: "drop",
+        paths: ["C:/mock/imports/notes.txt"],
+        position: { x: 420, y: 180 },
+      });
     });
 
     expect(await screen.findByText(textMatcher(en.transport.status.externalDropUnsupported))).toBeTruthy();

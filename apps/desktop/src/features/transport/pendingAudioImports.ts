@@ -46,6 +46,10 @@ function createPendingAudioImportId() {
   return `pending-audio-import-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
 }
 
+function pendingImportFileName(value: string) {
+  return value.split(/[\\/]/).at(-1) ?? value;
+}
+
 export function createPendingAudioImports(files: File[], dropSeconds: number): PendingAudioImport[] {
   return files.map((file) => {
     const id = createPendingAudioImportId();
@@ -53,6 +57,25 @@ export function createPendingAudioImports(files: File[], dropSeconds: number): P
     return {
       id,
       fileName: file.name,
+      temporaryAssetId: `pending-asset-${id}`,
+      temporaryTrackId: `pending-track-${id}`,
+      temporaryClipId: `pending-clip-${id}`,
+      dropSeconds,
+      status: "queued",
+    };
+  });
+}
+
+export function createPendingAudioImportsFromPaths(
+  paths: string[],
+  dropSeconds: number,
+): PendingAudioImport[] {
+  return paths.map((path) => {
+    const id = createPendingAudioImportId();
+
+    return {
+      id,
+      fileName: pendingImportFileName(path),
       temporaryAssetId: `pending-asset-${id}`,
       temporaryTrackId: `pending-track-${id}`,
       temporaryClipId: `pending-clip-${id}`,

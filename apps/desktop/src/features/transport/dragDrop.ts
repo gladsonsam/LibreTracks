@@ -19,6 +19,24 @@ export type DroppedFileClassification = {
   unsupportedFiles: File[];
 };
 
+export type NativeDroppedPathClassification =
+  | {
+      kind: "package";
+      packagePath: string;
+    }
+  | {
+      kind: "audio";
+      audioPaths: string[];
+    }
+  | {
+      kind: "mixed";
+      paths: string[];
+    }
+  | {
+      kind: "unsupported";
+      paths: string[];
+    };
+
 function getTransferTypes(dataTransfer: DataTransfer | null) {
   return Array.from(dataTransfer?.types ?? []);
 }
@@ -34,6 +52,10 @@ function fileExtension(fileName: string) {
   }
 
   return fileName.slice(lastDotIndex + 1).toLowerCase();
+}
+
+function pathFileName(path: string) {
+  return path.split(/[\\/]/).at(-1) ?? path;
 }
 
 export function isInternalLibraryDrag(dataTransfer: DataTransfer | null) {
@@ -120,6 +142,58 @@ export function classifyDroppedFiles(files: File[]): DroppedFileClassification {
     packageFile: null,
     audioFiles,
     unsupportedFiles,
+  };
+}
+
+export function classifyDroppedPaths(paths: string[]): NativeDroppedPathClassification {
+  const packagePaths: string[] = [];
+  const audioPaths: string[] = [];
+  const unsupportedPaths: string[] = [];
+
+  for (const path of paths) {
+    const extension = fileExtension(pathFileName(path));
+    if (extension === "ltpkg") {
+      packagePaths.push(path);
+      continue;
+    }
+
+    if (SUPPORTED_AUDIO_EXTENSIONS.has(extension)) {
+      audioPaths.push(path);
+      continue;
+    }
+
+    unsupportedPaths.push(path);
+  }
+
+  if (
+    packagePaths.length === 1 &&
+    audioPaths.length === 0 &&
+    unsupportedPaths.length === 0 &&
+    paths.length === 1
+  ) {
+    return {
+      kind: "package",
+      packagePath: packagePaths[0],
+    };
+  }
+
+  if (packagePaths.length > 0) {
+    return {
+      kind: "mixed",
+      paths,
+    };
+  }
+
+  if (audioPaths.length > 0 && unsupportedPaths.length === 0) {
+    return {
+      kind: "audio",
+      audioPaths,
+    };
+  }
+
+  return {
+    kind: "unsupported",
+    paths,
   };
 }
 

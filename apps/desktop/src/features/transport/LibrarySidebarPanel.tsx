@@ -3,19 +3,14 @@ import {
   useMemo,
   useRef,
   useState,
-  type DragEvent,
   type KeyboardEvent,
   type MouseEvent,
+  type PointerEvent as ReactPointerEvent,
 } from "react";
 import { useTranslation } from "react-i18next";
 
 import type { LibraryImportProgressEvent } from "./desktopApi";
-import { LIBRARY_ASSET_DRAG_MIME } from "./dragDrop";
 import { getPendingClipLabel, type PendingLibraryAssetSummary } from "./pendingAudioImports";
-
-const INTERNAL_DRAG_START_EVENT = "libretracks-internal-drag-start";
-const INTERNAL_DRAG_END_EVENT = "libretracks-internal-drag-end";
-const ROOT_GROUP_ID = "__root__";
 
 type ContextMenuAction = {
   label: string;
@@ -38,8 +33,11 @@ type LibrarySidebarPanelProps = {
   importProgress: LibraryImportProgressEvent | null;
   deletingFilePath: string | null;
   canImport: boolean;
-  onDragAssetsStart?: (assets: Array<{ file_path: string; durationSeconds: number }>) => void;
-  onDragAssetsEnd?: () => void;
+  onPointerDragStart?: (args: {
+    payload: Array<{ file_path: string; durationSeconds: number }>;
+    origin: { x: number; y: number };
+    current: { x: number; y: number };
+  }) => void;
   onLocateAsset?: (filePath: string) => void;
   onImport: () => void;
   onCreateFolder: () => void;
@@ -56,22 +54,6 @@ function formatAssetDuration(durationSeconds: number) {
   return `${String(minutes).padStart(2, "0")}:${String(seconds).padStart(2, "0")}`;
 }
 
-function readDraggedLibraryFilePaths(dataTransfer: DataTransfer | null) {
-  const payload = dataTransfer?.getData(LIBRARY_ASSET_DRAG_MIME);
-  if (!payload) {
-    return [];
-  }
-
-  try {
-    const parsed = JSON.parse(payload) as Array<{ file_path?: string }>;
-    return parsed
-      .map((entry) => entry.file_path)
-      .filter((filePath): filePath is string => Boolean(filePath));
-  } catch {
-    return [];
-  }
-}
-
 export function LibrarySidebarPanel({
   assets,
   folders,
@@ -80,8 +62,7 @@ export function LibrarySidebarPanel({
   importProgress,
   deletingFilePath,
   canImport,
-  onDragAssetsStart,
-  onDragAssetsEnd,
+  onPointerDragStart,
   onLocateAsset,
   onImport,
   onCreateFolder,
@@ -92,27 +73,12 @@ export function LibrarySidebarPanel({
 }: LibrarySidebarPanelProps) {
   const { t } = useTranslation();
   const [selectedAssetPaths, setSelectedAssetPaths] = useState<string[]>([]);
-  const [dragTargetGroupId, setDragTargetGroupId] = useState<string | null>(null);
   const [contextMenu, setContextMenu] = useState<ContextMenuState>(null);
-  const dragPreviewElementRef = useRef<HTMLElement | null>(null);
-  const activeDraggedFilePathsRef = useRef<string[]>([]);
   const contextMenuRef = useRef<HTMLDivElement | null>(null);
-
-  const handleFolderDragEnter = (event: DragEvent<HTMLElement>) => {
-    event.preventDefault();
-    event.dataTransfer.dropEffect = "move";
-  };
 
   useEffect(() => {
     setSelectedAssetPaths((current) => current.filter((filePath) => assets.some((asset) => asset.filePath === filePath)));
   }, [assets]);
-
-  useEffect(() => {
-    return () => {
-      dragPreviewElementRef.current?.remove();
-      dragPreviewElementRef.current = null;
-    };
-  }, []);
 
   useEffect(() => {
     if (!contextMenu) {
@@ -202,15 +168,6 @@ export function LibrarySidebarPanel({
     });
   };
 
-  const resolveDraggedFilePaths = (dataTransfer: DataTransfer | null) => {
-    const payload = readDraggedLibraryFilePaths(dataTransfer);
-    if (payload.length) {
-      return payload;
-    }
-
-    return activeDraggedFilePathsRef.current;
-  };
-
   const assetContextMenu = (asset: PendingLibraryAssetSummary) => {
     if (asset.isPending) {
       return [];
@@ -289,7 +246,11 @@ export function LibrarySidebarPanel({
     onDeleteRequested(selectedAssets);
   };
 
-  const handleAssetDragStart = (event: DragEvent<HTMLDivElement>, asset: LibraryAssetSummary) => {
+  const handleAssetPointerDown = (event: ReactPointerEvent<HTMLDivElement>, asset: PendingLibraryAssetSummary) => {
+    if (event.button !== 0 || asset.isPending) {
+      return;
+    }
+
     const draggedAssets =
       selectedAssetPathSet.has(asset.filePath) && selectedAssetPaths.length > 1
         ? assets.filter((candidate) => selectedAssetPathSet.has(candidate.filePath))
@@ -298,90 +259,39 @@ export function LibrarySidebarPanel({
       file_path: draggedAsset.filePath,
       durationSeconds: draggedAsset.durationSeconds,
     }));
-    const payload = JSON.stringify(dragPayload);
-    activeDraggedFilePathsRef.current = dragPayload.map((item) => item.file_path);
-
-    event.dataTransfer.effectAllowed = "copyMove";
-    event.dataTransfer.setData(LIBRARY_ASSET_DRAG_MIME, payload);
-    event.dataTransfer.setData("text/plain", dragPayload.map((item) => item.file_path).join("\n"));
-
-    dragPreviewElementRef.current?.remove();
-    dragPreviewElementRef.current = null;
-
-    const dragPreviewElement = event.currentTarget.cloneNode(true);
-    if (dragPreviewElement instanceof HTMLElement) {
-      dragPreviewElement.style.position = "fixed";
-      dragPreviewElement.style.top = "-10000px";
-      dragPreviewElement.style.left = "-10000px";
-      dragPreviewElement.style.width = `${Math.round(event.currentTarget.getBoundingClientRect().width)}px`;
-      dragPreviewElement.style.pointerEvents = "none";
-      dragPreviewElement.style.zIndex = "9999";
-      dragPreviewElement.style.opacity = "0.96";
-      document.body.appendChild(dragPreviewElement);
-      dragPreviewElementRef.current = dragPreviewElement;
-      if (typeof event.dataTransfer.setDragImage === "function") {
-        event.dataTransfer.setDragImage(dragPreviewElement, 22, 18);
-      }
-    }
-
-    window.dispatchEvent(
-      new CustomEvent(INTERNAL_DRAG_START_EVENT, {
-        detail: {
-          assetCount: dragPayload.length,
-          filePaths: dragPayload.map((item) => item.file_path),
-          types: Array.from(event.dataTransfer.types ?? []),
-          effectAllowed: event.dataTransfer.effectAllowed,
-        },
-      }),
-    );
-
-    onDragAssetsStart?.(dragPayload);
+    onPointerDragStart?.({
+      payload: dragPayload,
+      origin: { x: event.clientX, y: event.clientY },
+      current: { x: event.clientX, y: event.clientY },
+    });
   };
 
-  const handleAssetDragEnd = () => {
-    dragPreviewElementRef.current?.remove();
-    dragPreviewElementRef.current = null;
-    activeDraggedFilePathsRef.current = [];
-    setDragTargetGroupId(null);
-    window.dispatchEvent(
-      new CustomEvent(INTERNAL_DRAG_END_EVENT, {
-        detail: { reason: "dragend" },
-      }),
-    );
-    onDragAssetsEnd?.();
-  };
-
-  const handleGroupDragOver = (event: DragEvent<HTMLElement>, folderPath: string | null) => {
-    const draggedFilePaths = resolveDraggedFilePaths(event.dataTransfer);
-    if (!draggedFilePaths.length) {
+  const handleAssetMouseDown = (event: MouseEvent<HTMLDivElement>, asset: PendingLibraryAssetSummary) => {
+    if (
+      typeof window !== "undefined" &&
+      typeof (window as Window & { PointerEvent?: unknown }).PointerEvent === "function"
+    ) {
       return;
     }
 
-    event.preventDefault();
-    event.stopPropagation();
-    event.dataTransfer.dropEffect = "move";
-    setDragTargetGroupId(folderPath ?? ROOT_GROUP_ID);
-  };
-
-  const handleGroupDragLeave = (event: DragEvent<HTMLElement>) => {
-    if (event.currentTarget.contains(event.relatedTarget as Node | null)) {
+    if (event.button !== 0 || asset.isPending) {
       return;
     }
 
-    setDragTargetGroupId(null);
-  };
+    const draggedAssets =
+      selectedAssetPathSet.has(asset.filePath) && selectedAssetPaths.length > 1
+        ? assets.filter((candidate) => selectedAssetPathSet.has(candidate.filePath))
+        : [asset];
+    const dragPayload = draggedAssets.map((draggedAsset) => ({
+      file_path: draggedAsset.filePath,
+      durationSeconds: draggedAsset.durationSeconds,
+    }));
 
-  const handleGroupDrop = (event: DragEvent<HTMLElement>, folderPath: string | null) => {
-    const draggedFilePaths = resolveDraggedFilePaths(event.dataTransfer);
-    if (!draggedFilePaths.length) {
-      return;
-    }
-
-    event.preventDefault();
-    event.stopPropagation();
-    setDragTargetGroupId(null);
-    activeDraggedFilePathsRef.current = [];
-    onMoveAssetsToFolder(draggedFilePaths, folderPath);
+    onPointerDragStart?.({
+      payload: dragPayload,
+      origin: { x: event.clientX, y: event.clientY },
+      current: { x: event.clientX, y: event.clientY },
+    });
   };
 
   const renderAssetRows = (groupAssets: PendingLibraryAssetSummary[]) => {
@@ -400,8 +310,9 @@ export function LibrarySidebarPanel({
                 aria-label={asset.fileName}
                 aria-pressed={isSelected}
                 title={asset.fileName}
-                draggable={!isPending}
                 onClick={(event) => handleAssetSelect(event, asset)}
+                onMouseDown={(event) => handleAssetMouseDown(event, asset)}
+                onPointerDown={(event) => handleAssetPointerDown(event, asset)}
                 onContextMenu={(event) => {
                   if (isPending) {
                     event.preventDefault();
@@ -414,12 +325,6 @@ export function LibrarySidebarPanel({
                   openContextMenu(event, asset.fileName, assetContextMenu(asset));
                 }}
                 onKeyDown={(event) => handleAssetKeyDown(event, asset)}
-                onDragEnd={handleAssetDragEnd}
-                onDragStart={(event) => {
-                  if (!isPending) {
-                    handleAssetDragStart(event, asset);
-                  }
-                }}
               >
                 <span className="lt-library-asset-icon material-symbols-outlined">
                   {isPending ? "hourglass_top" : asset.isMissing ? "warning" : "music_note"}
@@ -502,12 +407,8 @@ export function LibrarySidebarPanel({
           <div className="lt-library-asset-groups">
             <details className="lt-library-root-group" open>
               <summary
-                className={`lt-library-folder-summary ${dragTargetGroupId === ROOT_GROUP_ID ? "is-drag-target" : ""}`}
+                className="lt-library-folder-summary"
                 onContextMenu={(event) => openContextMenu(event, t("library.rootFolder"), folderContextMenu(null))}
-                onDragEnter={handleFolderDragEnter}
-                onDragLeave={handleGroupDragLeave}
-                onDragOver={(event) => handleGroupDragOver(event, null)}
-                onDrop={(event) => handleGroupDrop(event, null)}
               >
                 <span className="material-symbols-outlined">home_storage</span>
                 <span className="lt-library-folder-copy">
@@ -521,12 +422,8 @@ export function LibrarySidebarPanel({
             {folderGroups.map((group) => (
               <details key={group.folderPath} className="lt-library-folder-group" open>
                 <summary
-                  className={`lt-library-folder-summary ${dragTargetGroupId === group.folderPath ? "is-drag-target" : ""}`}
+                  className="lt-library-folder-summary"
                   onContextMenu={(event) => openContextMenu(event, group.folderPath, folderContextMenu(group.folderPath))}
-                  onDragEnter={handleFolderDragEnter}
-                  onDragLeave={handleGroupDragLeave}
-                  onDragOver={(event) => handleGroupDragOver(event, group.folderPath)}
-                  onDrop={(event) => handleGroupDrop(event, group.folderPath)}
                 >
                   <span className="material-symbols-outlined">folder</span>
                   <span className="lt-library-folder-copy">
