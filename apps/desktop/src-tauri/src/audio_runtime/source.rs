@@ -279,6 +279,7 @@ impl StreamingClipReader {
         let (producer, consumer) = RingBuffer::<ClipSample>::new(ring_capacity.max(256));
         let (command_sender, command_receiver) = mpsc::channel();
         let worker_source = Arc::clone(&shared_source);
+        let transpose_semitones = plan.transpose_semitones;
         let _worker_handle = thread::Builder::new()
             .name("libretracks-streaming-source".into())
             .spawn(move || {
@@ -286,6 +287,7 @@ impl StreamingClipReader {
                     worker_source,
                     output_sample_rate,
                     source_start_seconds,
+                    transpose_semitones,
                     producer,
                     command_receiver,
                 )
@@ -480,6 +482,7 @@ fn run_streaming_worker(
     source: Arc<StreamingAudioSource>,
     output_sample_rate: u32,
     initial_start_seconds: f64,
+    transpose_semitones: i32,
     mut producer: Producer<ClipSample>,
     command_receiver: Receiver<StreamingWorkerCommand>,
 ) {
@@ -491,6 +494,7 @@ fn run_streaming_worker(
             &source,
             output_sample_rate,
             start_seconds,
+            transpose_semitones,
             generation,
             &mut producer,
             &command_receiver,
@@ -527,6 +531,7 @@ fn stream_decode_from(
     source: &StreamingAudioSource,
     output_sample_rate: u32,
     start_seconds: f64,
+    transpose_semitones: i32,
     generation: u64,
     producer: &mut Producer<ClipSample>,
     command_receiver: &Receiver<StreamingWorkerCommand>,
@@ -535,6 +540,11 @@ fn stream_decode_from(
         Ok(decoder) => decoder,
         Err(_) => return WorkerOutcome::Finished,
     };
+    let mut pitch_engine = pitch::create_pitch_shift_engine(
+        output_sample_rate,
+        source.channels.max(1),
+        transpose_semitones,
+    );
 
     loop {
         while let Ok(command) = command_receiver.try_recv() {
@@ -558,13 +568,23 @@ fn stream_decode_from(
         }
 
         let samples = match decoder.next_output_chunk(STREAM_WORKER_CHUNK_FRAMES) {
-            Ok(samples) if samples.is_empty() => return WorkerOutcome::Finished,
+            Ok(samples) if samples.is_empty() => {
+                let flushed = pitch_engine.process_interleaved(&[], true);
+                push_streaming_samples(producer, &flushed, generation, source.channels.max(1));
+                return WorkerOutcome::Finished;
+            }
             Ok(samples) => samples,
-            Err(_) => return WorkerOutcome::Finished,
+            Err(_) => {
+                let flushed = pitch_engine.process_interleaved(&[], true);
+                push_streaming_samples(producer, &flushed, generation, source.channels.max(1));
+                return WorkerOutcome::Finished;
+            }
         };
 
+        let processed_samples = pitch_engine.process_interleaved(&samples, false);
+
         let channels = source.channels.max(1);
-        for frame in samples.chunks_exact(channels) {
+        for frame in processed_samples.chunks_exact(channels) {
             // Wait until there is enough space for the WHOLE frame
             while producer.slots() < channels {
                 if let Ok(command) = command_receiver.try_recv() {
@@ -591,6 +611,25 @@ fn stream_decode_from(
                     value: sample,
                 });
             }
+        }
+    }
+}
+
+fn push_streaming_samples(
+    producer: &mut Producer<ClipSample>,
+    samples: &[f32],
+    generation: u64,
+    channels: usize,
+) {
+    let channels = channels.max(1);
+
+    for frame in samples.chunks_exact(channels) {
+        while producer.slots() < channels {
+            thread::yield_now();
+        }
+
+        for &sample in frame {
+            let _ = producer.push(ClipSample { generation, value: sample });
         }
     }
 }
@@ -969,6 +1008,7 @@ mod tests {
             fade_in_frames: 0,
             fade_out_frames: 0,
             source_start_seconds: 0.0,
+            transpose_semitones: 0,
         };
 
         let reader = StreamingClipReader::open(&plan, 48_000, &audio_buffers, 0)

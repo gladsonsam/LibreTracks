@@ -6,6 +6,7 @@ import {
   buildSongTempoRegions,
   getSongRegionAtPosition,
   getSongTempoRegionAtPosition,
+  formatTransposeSemitones,
   type AppSettings,
   type AudioMeterLevel,
   type SongView,
@@ -931,6 +932,23 @@ function TransportView() {
     });
   };
 
+  const updateSelectedRegionTranspose = (delta: number) => {
+    if (!selectedRegion) {
+      return;
+    }
+
+    const nextTransposeSemitones = Math.max(-12, Math.min(12, selectedRegion.transposeSemitones + delta));
+    if (nextTransposeSemitones === selectedRegion.transposeSemitones) {
+      return;
+    }
+
+    sendCommand({
+      cmd: "updateSongRegionTranspose",
+      regionId: selectedRegion.id,
+      transposeSemitones: nextTransposeSemitones,
+    });
+  };
+
   const toggleVamp = () => {
     sendCommand({
       cmd: "toggleVamp",
@@ -1193,12 +1211,23 @@ function TransportView() {
                     setSelectedRegionId(region.id);
                   }}
                 >
-                  {region.name}
+                  <span>{region.name}</span>
+                  {region.transposeSemitones !== 0 ? (
+                    <em>{formatTransposeSemitones(region.transposeSemitones)} st</em>
+                  ) : null}
                 </button>
               ))}
             </div>
             {selectedRegion ? (
               <div className="selected-region-actions">
+                <div className="selected-region-transpose">
+                  <span>{STRINGS.transpose}</span>
+                  <div className="selected-region-transpose-controls">
+                    <button type="button" onClick={() => updateSelectedRegionTranspose(-1)}>-</button>
+                    <strong>{formatTransposeSemitones(selectedRegion.transposeSemitones)} st</strong>
+                    <button type="button" onClick={() => updateSelectedRegionTranspose(1)}>+</button>
+                  </div>
+                </div>
                 <button
                   className="jump-cancel-button region-jump-button"
                   onClick={() => scheduleRegionJump(selectedRegion.id)}
@@ -1369,6 +1398,14 @@ function MixerStrip({
     });
   };
 
+  const toggleTranspose = () => {
+    sendCommand({
+      cmd: "updateTrackTransposeEnabled",
+      trackId: track.id,
+      transposeEnabled: !effectiveTrack.transposeEnabled,
+    });
+  };
+
   return (
     <article
       className={`mixer-strip ${track.kind === "folder" ? "is-folder" : ""} ${palette ? "is-folder-child" : ""}`}
@@ -1377,6 +1414,13 @@ function MixerStrip({
       <header className="mixer-strip-header">
         <small>{track.kind === "folder" ? STRINGS.folder : STRINGS.audio}</small>
         <strong>{track.name}</strong>
+        <button
+          type="button"
+          className={`mini-action transpose-toggle ${effectiveTrack.transposeEnabled ? "is-active" : ""}`}
+          onClick={toggleTranspose}
+        >
+          {STRINGS.transposeTrack} {effectiveTrack.transposeEnabled ? STRINGS.transposeOn : STRINGS.transposeOff}
+        </button>
       </header>
 
       <div className="pan-section">

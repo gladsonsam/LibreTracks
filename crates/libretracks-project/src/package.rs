@@ -107,6 +107,8 @@ struct SongPackageManifest {
     base_time_signature: String,
     duration_seconds: f64,
     #[serde(default)]
+    region_transpose_semitones: i32,
+    #[serde(default)]
     tracks: Vec<Track>,
     #[serde(default)]
     clips: Vec<Clip>,
@@ -245,6 +247,7 @@ pub fn export_region_as_package(
         base_bpm: song.bpm,
         base_time_signature: song.time_signature.clone(),
         duration_seconds: region_duration,
+        region_transpose_semitones: region.transpose_semitones,
         tracks,
         clips: clips.clone(),
         section_markers,
@@ -334,6 +337,14 @@ fn import_song_package_from_archive<R: Read + Seek>(
         .map_err(|error| ProjectError::AudioDecode(error.to_string()))?
         .read_to_string(&mut manifest_json)?;
     let manifest: SongPackageManifest = serde_json::from_str(&manifest_json)?;
+    if !(libretracks_core::MIN_TRANSPOSE_SEMITONES..=libretracks_core::MAX_TRANSPOSE_SEMITONES)
+        .contains(&manifest.region_transpose_semitones)
+    {
+        return Err(ProjectError::AudioDecode(format!(
+            "invalid region transpose semitones: {}",
+            manifest.region_transpose_semitones
+        )));
+    }
     let library_meta = manifest.library_meta.clone();
 
     let waveform_dir = song_dir.join("cache").join("waveforms");
@@ -395,6 +406,7 @@ fn import_song_package_from_archive<R: Read + Seek>(
             pan: track.pan,
             muted: false,
             solo: false,
+            transpose_enabled: track.transpose_enabled,
             audio_to: "master".to_string(),
         });
         track_ids_by_name.insert(track.name.clone(), track_id);
@@ -440,6 +452,7 @@ fn import_song_package_from_archive<R: Read + Seek>(
         name: manifest.song_title.clone(),
         start_seconds: insert_at_seconds,
         end_seconds: insert_at_seconds + manifest.duration_seconds,
+        transpose_semitones: manifest.region_transpose_semitones,
     });
     next_song.regions.sort_by(|left, right| {
         left.start_seconds

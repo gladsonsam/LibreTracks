@@ -1,11 +1,13 @@
 import { useState, type ReactNode } from "react";
 import { useTranslation } from "react-i18next";
 
+import { formatTransposeSemitones, type SongRegionSummary } from "./desktopApi";
 import type { GlobalJumpMode, SongJumpTrigger, SongTransitionMode, VampMode } from "./uiStore";
 
 type TimelineToolbarProps = {
   snapEnabled: boolean;
   subdivisionPerBeat: number;
+  selectedRegion: SongRegionSummary | null;
   globalJumpMode: GlobalJumpMode;
   globalJumpBars: number;
   songJumpTrigger: SongJumpTrigger;
@@ -29,6 +31,7 @@ type TimelineToolbarProps = {
   onVampBarsChange: (bars: number) => void;
   onToggleVamp: () => void;
   onCancelPendingJump: () => void;
+  onSelectedRegionTransposeChange: (nextTransposeSemitones: number) => void;
   midiLearnMode: string | null;
   onMidiLearnTarget: (controlKey: string) => void;
 };
@@ -94,6 +97,7 @@ function ControlGroup({
 export function TimelineToolbar({
   snapEnabled,
   subdivisionPerBeat,
+  selectedRegion,
   globalJumpMode,
   globalJumpBars,
   songJumpTrigger,
@@ -117,12 +121,13 @@ export function TimelineToolbar({
   onVampBarsChange,
   onToggleVamp,
   onCancelPendingJump,
+  onSelectedRegionTransposeChange,
   midiLearnMode,
   onMidiLearnTarget,
 }: TimelineToolbarProps) {
   const { t } = useTranslation();
   const learnModeActive = midiLearnMode !== null;
-  const [openGroup, setOpenGroup] = useState<"jump" | "vamp" | "song" | null>(null);
+  const [openGroup, setOpenGroup] = useState<"jump" | "vamp" | "song" | "region" | null>(null);
   const controlsDisabled = isProjectEmpty && !learnModeActive;
   const jumpSummary =
     globalJumpMode === "after_bars"
@@ -141,6 +146,10 @@ export function TimelineToolbar({
       ? t("timelineToolbar.songTransitionFadeOut")
       : t("timelineToolbar.songTransitionInstant");
   const songSummary = `${songJumpSummary} / ${songTransitionSummary}`;
+  const regionSummary = selectedRegion
+    ? `${formatTransposeSemitones(selectedRegion.transposeSemitones)} st`
+    : t("timelineToolbar.regionTransposeNoSelection");
+  const regionControlsDisabled = controlsDisabled || !selectedRegion;
 
   const handleModeButtonClick = (
     learnKey: string,
@@ -527,6 +536,55 @@ export function TimelineToolbar({
               </button>
             </div>
           </ControlGroup>
+
+          <ControlGroup
+            title={t("timelineToolbar.regionTransposeLabel")}
+            summary={regionSummary}
+            open={openGroup === "region"}
+            onToggleOpen={() => setOpenGroup((current) => (current === "region" ? null : "region"))}
+            className="lt-control-group-region"
+            details={
+              selectedRegion ? (
+                <label className="lt-stepper-control">
+                  <span>{t("timelineToolbar.regionTransposeLabel")}</span>
+                  <div className="lt-stepper-control-row">
+                    <button
+                      type="button"
+                      aria-label={t("timelineToolbar.regionTransposeDownAria")}
+                      disabled={regionControlsDisabled}
+                      onClick={() => {
+                        onSelectedRegionTransposeChange(Math.max(-12, selectedRegion.transposeSemitones - 1));
+                      }}
+                    >
+                      -
+                    </button>
+                    <input
+                      aria-label={t("timelineToolbar.regionTransposeAria")}
+                      type="number"
+                      min={-12}
+                      max={12}
+                      step={1}
+                      value={selectedRegion.transposeSemitones}
+                      disabled={regionControlsDisabled}
+                      onChange={(event) => onSelectedRegionTransposeChange(Number(event.target.value) || 0)}
+                    />
+                    <button
+                      type="button"
+                      aria-label={t("timelineToolbar.regionTransposeUpAria")}
+                      disabled={regionControlsDisabled}
+                      onClick={() => {
+                        onSelectedRegionTransposeChange(Math.min(12, selectedRegion.transposeSemitones + 1));
+                      }}
+                    >
+                      +
+                    </button>
+                  </div>
+                </label>
+              ) : (
+                <span>{t("timelineToolbar.regionTransposeNoSelection")}</span>
+              )
+            }
+          />
 
           <button
             type="button"

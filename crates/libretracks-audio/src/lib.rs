@@ -787,6 +787,7 @@ mod tests {
                 name: "Digno y Santo".into(),
                 start_seconds: 0.0,
                 end_seconds: 24.0,
+                transpose_semitones: 0,
             }],
             tracks: vec![
                 Track {
@@ -798,6 +799,7 @@ mod tests {
                     pan: 0.0,
                     muted: false,
                     solo: false,
+                    transpose_enabled: true,
                     audio_to: "ext:2-3".to_string(),
                 },
                 Track {
@@ -809,6 +811,7 @@ mod tests {
                     pan: 0.0,
                     muted: false,
                     solo: false,
+                    transpose_enabled: true,
                     audio_to: "ext:2-3".to_string(),
                 },
                 Track {
@@ -820,6 +823,7 @@ mod tests {
                     pan: 0.0,
                     muted: false,
                     solo: false,
+                    transpose_enabled: true,
                     audio_to: "master".to_string(),
                 },
                 Track {
@@ -831,6 +835,7 @@ mod tests {
                     pan: 0.0,
                     muted: false,
                     solo: false,
+                    transpose_enabled: true,
                     audio_to: "master".to_string(),
                 },
             ],
@@ -909,18 +914,21 @@ mod tests {
                     name: "Intro".into(),
                     start_seconds: 0.0,
                     end_seconds: 8.0,
+                    transpose_semitones: 0,
                 },
                 SongRegion {
                     id: "region_bridge".into(),
                     name: "Bridge".into(),
                     start_seconds: 8.0,
                     end_seconds: 14.0,
+                    transpose_semitones: 0,
                 },
                 SongRegion {
                     id: "region_outro".into(),
                     name: "Outro".into(),
                     start_seconds: 14.0,
                     end_seconds: 18.0,
+                    transpose_semitones: 0,
                 },
             ],
             tracks: vec![Track {
@@ -932,6 +940,7 @@ mod tests {
                 pan: 0.0,
                 muted: false,
                 solo: false,
+                transpose_enabled: true,
                 audio_to: "master".to_string(),
             }],
             clips: vec![Clip {

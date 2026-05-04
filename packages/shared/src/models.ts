@@ -17,6 +17,7 @@ export type SongRegionSummary = {
   name: string;
   startSeconds: number;
   endSeconds: number;
+  transposeSemitones: number;
 };
 
 export type SongTempoRegionSummary = SongRegionSummary & TimelineRegion;
@@ -59,7 +60,16 @@ export type TrackSummary = {
   muted: boolean;
   solo: boolean;
   audioTo: string;
+  transposeEnabled: boolean;
 };
+
+export function formatTransposeSemitones(value: number): string {
+  if (value === 0) {
+    return "0";
+  }
+
+  return value > 0 ? `+${value}` : `${value}`;
+}
 
 export type ClipSummary = {
   id: string;

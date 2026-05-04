@@ -216,6 +216,10 @@ export async function exportRegionAsPackage(regionId: string): Promise<void> {
   await invokeCommand("export_region_as_package", { regionId });
 }
 
+export async function exportRegionRenderedAudio(regionId: string): Promise<void> {
+  await invokeCommand("export_region_rendered_audio", { regionId });
+}
+
 export async function importSongPackage(
   packagePath: string,
   insertAtSeconds: number,
@@ -395,6 +399,16 @@ export async function updateSongRegion(
   });
 }
 
+export async function updateSongRegionTranspose(
+  regionId: string,
+  transposeSemitones: number,
+): Promise<TransportSnapshot> {
+  return invokeCommand<TransportSnapshot>("update_song_region_transpose", {
+    regionId,
+    transposeSemitones,
+  });
+}
+
 export async function deleteSongRegion(regionId: string): Promise<TransportSnapshot> {
   return invokeCommand<TransportSnapshot>("delete_song_region", { regionId });
 }
@@ -466,6 +480,13 @@ export async function updateTrack(args: {
   audioTo?: string;
 }): Promise<TransportSnapshot> {
   return invokeCommand<TransportSnapshot>("update_track", args);
+}
+
+export async function updateTrackTransposeEnabled(args: {
+  trackId: string;
+  transposeEnabled: boolean;
+}): Promise<TransportSnapshot> {
+  return invokeCommand<TransportSnapshot>("update_track_transpose_enabled", args);
 }
 
 export async function updateTrackMixLive(args: {

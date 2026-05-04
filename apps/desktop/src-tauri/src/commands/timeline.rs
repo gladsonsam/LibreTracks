@@ -214,6 +214,22 @@ pub fn update_song_region(
 }
 
 #[tauri::command]
+pub fn update_song_region_transpose(
+    region_id: String,
+    transpose_semitones: i32,
+    state: State<'_, DesktopState>,
+) -> Result<TransportSnapshot, String> {
+    let mut session = state
+        .session
+        .lock()
+        .map_err(|_| DesktopError::StatePoisoned.to_string())?;
+
+    session
+        .update_song_region_transpose(&region_id, transpose_semitones, &state.audio)
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
 pub fn delete_song_region(
     region_id: String,
     state: State<'_, DesktopState>,
@@ -411,6 +427,22 @@ pub fn update_track(
             audio_to.as_deref(),
             &state.audio,
         )
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub fn update_track_transpose_enabled(
+    track_id: String,
+    transpose_enabled: bool,
+    state: State<'_, DesktopState>,
+) -> Result<TransportSnapshot, String> {
+    let mut session = state
+        .session
+        .lock()
+        .map_err(|_| DesktopError::StatePoisoned.to_string())?;
+
+    session
+        .update_track_transpose_enabled(&track_id, transpose_enabled, &state.audio)
         .map_err(|error| error.to_string())
 }
 

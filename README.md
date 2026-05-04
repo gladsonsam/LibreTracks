@@ -37,8 +37,11 @@ The desktop workflow assumes the following tools are installed:
 - Rust stable toolchain with `cargo` and `rustc`
 - Microsoft Visual C++ Build Tools on Windows
 - Windows 10/11 SDK on Windows for MSVC linking
+- LLVM/Clang with `libclang.dll` on Windows for bindgen-based crates
 
 For Windows native desktop runs, `scripts/desktop-native.ps1` checks for the MSVC linker and SDK libraries. In practice, install Visual Studio Build Tools with the `Desktop development with C++` workload before running the native Tauri target.
+
+If `cargo check` later reports that bindgen cannot find `libclang`, install LLVM and set `LIBCLANG_PATH` to the directory that contains `libclang.dll` (for example `C:\Program Files\LLVM\bin`). If `winget install -e --id LLVM.LLVM` does not complete on your machine, install LLVM manually from the official installer or use another package manager such as Chocolatey.
 
 ## Getting Started
 
@@ -93,6 +96,8 @@ LibreTracks now includes an integrated remote access flow in the desktop UI:
 The remote web surface mirrors live actions from desktop and exposes transport controls, jump controls, and a dedicated mixer view for fast level/mute/solo adjustments during rehearsals and shows.
 
 The remote also exposes the newer live controls: `Vamp`, marker jump settings, song jump settings, and song transition mode. Use it as a compact stage surface when the desktop operator needs to stay focused on the timeline.
+
+Region transpose is also available per song region, and tracks expose a transpose enable toggle so pitch handling can be managed from the timeline without leaving the transport view.
 
 ## Project Structure
 

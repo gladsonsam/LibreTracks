@@ -112,6 +112,14 @@ pub enum RemoteCommand {
         muted: Option<bool>,
         solo: Option<bool>,
     },
+    UpdateRegionTranspose {
+        region_id: String,
+        transpose_semitones: i32,
+    },
+    UpdateTrackTransposeEnabled {
+        track_id: String,
+        transpose_enabled: bool,
+    },
     UpdateMetronome {
         enabled: Option<bool>,
         volume: Option<f64>,

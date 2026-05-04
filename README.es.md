@@ -36,8 +36,11 @@ El flujo desktop asume estas dependencias instaladas:
 - Rust stable toolchain con `cargo` y `rustc`
 - Microsoft Visual C++ Build Tools en Windows
 - Windows 10/11 SDK en Windows para el enlazado MSVC
+- LLVM/Clang con `libclang.dll` en Windows para las crates que usan bindgen
 
 Para ejecutar el target nativo en Windows, `scripts/desktop-native.ps1` comprueba el linker de MSVC y las librerías del SDK. En la práctica, necesitas Visual Studio Build Tools con la carga `Desktop development with C++` antes de ejecutar la app Tauri nativa.
+
+Si `cargo check` despues avisa de que bindgen no puede encontrar `libclang`, instala LLVM y apunta `LIBCLANG_PATH` al directorio que contiene `libclang.dll` (por ejemplo `C:\Program Files\LLVM\bin`). Si `winget install -e --id LLVM.LLVM` no termina en tu equipo, instala LLVM manualmente con el instalador oficial o usa otro gestor de paquetes como Chocolatey.
 
 ## Getting Started
 
@@ -92,6 +95,8 @@ LibreTracks ahora incluye un flujo de acceso remoto integrado en la UI desktop:
 La superficie web remota refleja acciones en vivo desde desktop y expone controles de transporte, controles de salto y una vista dedicada de mixer para ajustes rapidos de volumen/mute/solo durante ensayos y show.
 
 El remote tambien expone los controles nuevos de directo: `Vamp`, ajustes de salto de marca, ajustes de salto de cancion y modo de transicion de cancion. Es util como superficie compacta cuando el operador desktop necesita seguir centrado en el timeline.
+
+La transposicion por region de cancion tambien esta disponible, y los tracks exponen un toggle para activar o desactivar la transposicion de tono desde la misma vista de transporte.
 
 ## Project Structure
 

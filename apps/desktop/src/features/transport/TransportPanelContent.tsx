@@ -13,45 +13,66 @@ import { useTranslation } from "react-i18next";
 import { open } from "@tauri-apps/plugin-dialog";
 import {
   DEFAULT_APP_SETTINGS,
-  assignSectionMarkerDigit,
-  cancelMarkerJump,
-  createSectionMarker,
-  createSongRegion,
-  createClipsBatch,
-  createLibraryFolder,
-  createSong,
-  createTrack,
-  deleteLibraryFolder,
-  deleteClip,
-  deleteSongRegion,
-  deleteSongTempoMarker,
-  deleteSongTimeSignatureMarker,
-  deleteSectionMarker,
-  deleteTrack,
-  duplicateClip,
-  deleteLibraryAsset,
-  getLibraryAssets,
-  getLibraryFolders,
-  getAudioOutputDevices,
-  getMidiInputs,
-  getRemoteServerInfo,
-  getSettings,
   buildSongTempoRegions,
   getPrimarySongRegion,
   getSongBaseBpm,
   getSongBaseTimeSignature,
   getSongTempoRegionAtPosition,
   getSongRegionAtPosition,
+  normalizeAppSettings,
+  type AppSettings,
+  type AudioMeterLevel,
+  type ClipSummary,
+  type JumpTriggerLabel,
+  type LibraryAssetSummary,
+  type LibraryImportProgressEvent,
+  type MidiBinding,
+  type RemoteServerInfo,
+  type SectionMarkerSummary,
+  type SongRegionSummary,
+  type SongView,
+  type TempoMarkerSummary,
+  type TimeSignatureMarkerSummary,
+  type TrackKind,
+  type TransportLifecycleEvent,
+  type TrackSummary,
+  type TransportSnapshot,
+  type WaveformSummaryDto,
+} from "@libretracks/shared/models";
+import {
+  assignSectionMarkerDigit,
+  cancelMarkerJump,
+  createClipsBatch,
+  createLibraryFolder,
+  createSectionMarker,
+  createSong,
+  createSongRegion,
+  createTrack,
+  deleteClip,
+  deleteLibraryAsset,
+  deleteLibraryFolder,
+  deleteSectionMarker,
+  deleteSongRegion,
+  deleteSongTempoMarker,
+  deleteSongTimeSignatureMarker,
+  deleteTrack,
+  duplicateClip,
+  exportRegionAsPackage,
+  getAudioOutputDevices,
+  getLibraryAssets,
+  getLibraryFolders,
   getLibraryWaveformSummaries,
+  getMidiInputs,
+  getRemoteServerInfo,
+  getSettings,
   getSongView,
   getTransportSnapshot,
   getWaveformSummaries,
   importLibraryAssetsFromDialog,
-  pickAndImportSong,
   importSongPackageFromBase64,
   isTauriApp,
-  listenToLibraryImportProgress,
   listenToAudioMeters,
+  listenToLibraryImportProgress,
   listenToMidiRawMessage,
   listenToSettingsUpdated,
   listenToTransportLifecycle,
@@ -62,9 +83,11 @@ import {
   moveTrack,
   openProject,
   pauseTransport,
+  pickAndImportSong,
   playTransport,
   redoAction,
   renameLibraryFolder,
+  reportUiRenderMetric,
   resolveMissingFile,
   saveProject,
   saveProjectAs,
@@ -77,34 +100,17 @@ import {
   toggleVamp,
   undoAction,
   updateAudioSettings,
-  exportRegionAsPackage,
   updateSectionMarker,
   updateSongRegion,
-  upsertSongTempoMarker,
-  upsertSongTimeSignatureMarker,
-  updateSongTimeSignature,
+  updateSongRegionTranspose,
   updateSongTempo,
+  updateSongTimeSignature,
   updateTrack,
   updateTrackMixLive,
-  normalizeAppSettings,
-  type AppSettings,
-  type ClipSummary,
-  type MidiBinding,
-  type JumpTriggerLabel,
-  type LibraryAssetSummary,
-  type LibraryImportProgressEvent,
-  type RemoteServerInfo,
-  type SectionMarkerSummary,
-  type SongRegionSummary,
-  type SongView,
-  type TempoMarkerSummary,
-  type TimeSignatureMarkerSummary,
-  type TrackKind,
-  type TransportLifecycleEvent,
-  type TrackSummary,
-  type TransportSnapshot,
-  type WaveformSummaryDto,
-  reportUiRenderMetric,
+  updateTrackTransposeEnabled,
+  upsertSongTempoMarker,
+  upsertSongTimeSignatureMarker,
+  formatTransposeSemitones,
 } from "./desktopApi";
 import { getSystemLanguage } from "../../shared/i18n";
 import { LibrarySidebarPanel } from "./LibrarySidebarPanel";
@@ -850,6 +856,10 @@ export function TransportPanelContent() {
   const [libraryClipPreview, setLibraryClipPreview] = useState<LibraryClipPreviewState[]>([]);
   const [packageDropPreviewSeconds, setPackageDropPreviewSeconds] = useState<number | null>(null);
   const [selectedRegionId, setSelectedRegionId] = useState<string | null>(null);
+  const selectedRegion = useMemo(
+    () => song?.regions.find((region) => region.id === selectedRegionId) ?? null,
+    [selectedRegionId, song?.regions],
+  );
   const [selectedTimelineRange, setSelectedTimelineRange] = useState<TimelineRangeSelection | null>(null);
   const [optimisticClipOperations, setOptimisticClipOperations] = useState<OptimisticClipOperation[]>([]);
   const [isLibraryLoading, setIsLibraryLoading] = useState(false);
@@ -3987,6 +3997,42 @@ export function TransportPanelContent() {
     });
   }, [persistTrackMix, runAction]);
 
+  const handleTrackHeaderTransposeToggle = useCallback((trackId: string) => {
+    const track = findTrack(songRef.current, trackId);
+    if (!track) {
+      return;
+    }
+
+    void runAction(async () => {
+      const nextSnapshot = await updateTrackTransposeEnabled({
+        trackId,
+        transposeEnabled: !track.transposeEnabled,
+      });
+      applyPlaybackSnapshot(nextSnapshot);
+      setStatus(t("transport.status.trackTransposeUpdated", { name: track.name }));
+    });
+  }, [applyPlaybackSnapshot, runAction, setStatus, t]);
+
+  const handleSelectedRegionTransposeChange = useCallback((nextTransposeSemitones: number) => {
+    if (!selectedRegion) {
+      return;
+    }
+
+    const clampedTransposeSemitones = Math.max(-12, Math.min(12, Math.round(nextTransposeSemitones)));
+    if (clampedTransposeSemitones === selectedRegion.transposeSemitones) {
+      return;
+    }
+
+    void runAction(async () => {
+      const nextSnapshot = await updateSongRegionTranspose(selectedRegion.id, clampedTransposeSemitones);
+      applyPlaybackSnapshot(nextSnapshot);
+      setStatus(t("transport.status.regionTransposeUpdated", {
+        name: selectedRegion.name,
+        transpose: formatTransposeSemitones(clampedTransposeSemitones),
+      }));
+    });
+  }, [applyPlaybackSnapshot, runAction, selectedRegion, setStatus, t]);
+
   function clipContextMenu(clip: ClipSummary) {
     const currentCursorSeconds = displayPositionSecondsRef.current;
     const canSplit =
@@ -5691,6 +5737,7 @@ export function TransportPanelContent() {
         <TimelineToolbar
           snapEnabled={snapEnabled}
           subdivisionPerBeat={timelineGrid.subdivisionPerBeat}
+          selectedRegion={selectedRegion}
           globalJumpMode={appSettings.globalJumpMode}
           globalJumpBars={appSettings.globalJumpBars}
           songJumpTrigger={appSettings.songJumpTrigger}
@@ -5731,6 +5778,7 @@ export function TransportPanelContent() {
               setStatus(t("transport.status.jumpCancelled"));
             })
           }
+          onSelectedRegionTransposeChange={handleSelectedRegionTransposeChange}
           midiLearnMode={midiLearnMode}
           onMidiLearnTarget={handleMidiLearnTarget}
         />
@@ -5755,6 +5803,7 @@ export function TransportPanelContent() {
                 onToggleFolder={handleTrackHeaderFolderToggle}
                 onToggleMute={handleTrackHeaderMuteToggle}
                 onToggleSolo={handleTrackHeaderSoloToggle}
+                onToggleTranspose={handleTrackHeaderTransposeToggle}
                 onVolumeChange={handleTrackHeaderVolumeChange}
                 onCommitVolume={handleTrackHeaderVolumeCommit}
                 onPanChange={handleTrackHeaderPanChange}
@@ -5778,6 +5827,10 @@ export function TransportPanelContent() {
                 selectedTimelineRange={selectedTimelineRange}
                 selectedClipId={selectedClipId}
                 selectedRegionId={selectedRegionId}
+                onSelectRegion={(regionId) => {
+                  setSelectedRegionId(regionId);
+                  setSelectedTimelineRange(null);
+                }}
                 selectedSectionId={selectedSectionId}
                 pendingMarkerJump={pendingMarkerJump}
                 activeVamp={activeVamp}

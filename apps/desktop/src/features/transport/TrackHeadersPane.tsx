@@ -26,6 +26,7 @@ type TrackHeadersPaneProps = {
   onToggleFolder: (trackId: string) => void;
   onToggleMute: (trackId: string) => void;
   onToggleSolo: (trackId: string) => void;
+  onToggleTranspose: (trackId: string) => void;
   onVolumeChange: (trackId: string, nextVolume: number) => void;
   onCommitVolume: (trackId: string) => void;
   onPanChange: (trackId: string, nextPan: number) => void;
@@ -51,6 +52,7 @@ export function TrackHeadersPane({
   onToggleFolder,
   onToggleMute,
   onToggleSolo,
+  onToggleTranspose,
   onVolumeChange,
   onCommitVolume,
   onPanChange,
@@ -91,6 +93,7 @@ export function TrackHeadersPane({
                 panValue={track.pan}
                 trackMuted={track.muted}
                 trackSolo={track.solo}
+                trackTransposeEnabled={track.transposeEnabled}
                 volumeValue={track.volume}
                 audioTo={track.audioTo}
                 audioRoutingOptions={audioRoutingOptions}
@@ -106,6 +109,7 @@ export function TrackHeadersPane({
                 onToggleFolder={onToggleFolder}
                 onToggleMute={onToggleMute}
                 onToggleSolo={onToggleSolo}
+                onToggleTranspose={onToggleTranspose}
                 onVolumeChange={onVolumeChange}
                 onCommitVolume={onCommitVolume}
                 onPanChange={onPanChange}

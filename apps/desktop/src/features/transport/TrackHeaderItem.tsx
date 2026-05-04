@@ -31,6 +31,7 @@ type TrackHeaderItemProps = {
   panValue: number;
   trackMuted: boolean;
   trackSolo: boolean;
+  trackTransposeEnabled: boolean;
   volumeValue: number;
   audioTo: string;
   audioRoutingOptions: Array<{ value: string; label: string }>;
@@ -49,6 +50,7 @@ type TrackHeaderItemProps = {
   onToggleFolder: (trackId: string) => void;
   onToggleMute: (trackId: string) => void;
   onToggleSolo: (trackId: string) => void;
+  onToggleTranspose: (trackId: string) => void;
   onVolumeChange: (trackId: string, nextVolume: number) => void;
   onCommitVolume: (trackId: string) => void;
   onPanChange: (trackId: string, nextPan: number) => void;
@@ -66,6 +68,7 @@ function TrackHeaderItemComponent({
   panValue,
   trackMuted,
   trackSolo,
+  trackTransposeEnabled,
   volumeValue,
   audioTo,
   audioRoutingOptions,
@@ -81,6 +84,7 @@ function TrackHeaderItemComponent({
   onToggleFolder,
   onToggleMute,
   onToggleSolo,
+  onToggleTranspose,
   onVolumeChange,
   onCommitVolume,
   onPanChange,
@@ -168,6 +172,22 @@ function TrackHeaderItemComponent({
                 }}
               >
                 S
+              </button>
+              <button
+                type="button"
+                className={trackTransposeEnabled ? "is-active" : ""}
+                aria-label={trackTransposeEnabled
+                  ? t("trackHeader.transposeDisableAria", { name: trackName })
+                  : t("trackHeader.transposeEnableAria", { name: trackName })}
+                title={trackTransposeEnabled
+                  ? t("trackHeader.transposeDisableAria", { name: trackName })
+                  : t("trackHeader.transposeEnableAria", { name: trackName })}
+                onClick={(event) => {
+                  event.stopPropagation();
+                  onToggleTranspose(trackId);
+                }}
+              >
+                T
               </button>
             </div>
             <div className="lt-track-mix-controls">
@@ -278,6 +298,7 @@ function areTrackHeaderPropsEqual(previous: TrackHeaderItemProps, next: TrackHea
     previous.panValue === next.panValue &&
     previous.trackMuted === next.trackMuted &&
     previous.trackSolo === next.trackSolo &&
+    previous.trackTransposeEnabled === next.trackTransposeEnabled &&
     previous.volumeValue === next.volumeValue &&
     previous.audioTo === next.audioTo &&
     previous.audioRoutingOptions === next.audioRoutingOptions &&

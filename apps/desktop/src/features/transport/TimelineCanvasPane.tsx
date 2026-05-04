@@ -19,6 +19,7 @@ import type {
 } from "./desktopApi";
 import {
   buildSongTempoRegions,
+  formatTransposeSemitones,
   getSongBaseBpm,
   getSongBaseTimeSignature,
 } from "./desktopApi";
@@ -68,6 +69,7 @@ type TimelineCanvasPaneProps = {
   selectedTimelineRange: { startSeconds: number; endSeconds: number } | null;
   selectedClipId: string | null;
   selectedRegionId: string | null;
+  onSelectRegion: (regionId: string) => void;
   selectedSectionId: string | null;
   pendingMarkerJump: PendingJumpSummary | null;
   activeVamp: ActiveVampSummary | null;
@@ -148,6 +150,7 @@ export function TimelineCanvasPane({
   selectedTimelineRange,
   selectedClipId,
   selectedRegionId,
+  onSelectRegion,
   selectedSectionId,
   pendingMarkerJump,
   activeVamp,
@@ -339,8 +342,8 @@ export function TimelineCanvasPane({
                 key={region.id}
                 type="button"
                 className={`lt-region-hotspot ${selectedRegionId === region.id ? "is-selected" : ""}`}
-                aria-label={`Carril superior: región ${region.name}`}
-                title={`Carril superior: región ${region.name}`}
+                aria-label={`Carril superior: región ${region.name}${region.transposeSemitones !== 0 ? `, ${formatTransposeSemitones(region.transposeSemitones)} semitonos` : ""}`}
+                title={`Carril superior: región ${region.name}${region.transposeSemitones !== 0 ? `, ${formatTransposeSemitones(region.transposeSemitones)} semitonos` : ""}`}
                 style={{
                   left: region.startSeconds * pixelsPerSecond,
                   top: LANE_REGIONS.top,
@@ -364,12 +367,19 @@ export function TimelineCanvasPane({
                     }
                     return;
                   }
+
+                  onSelectRegion(region.id);
                 }}
                 onContextMenu={(event) => {
                   event.stopPropagation();
                   onRegionContextMenu(event, region.id);
                 }}
               >
+                {region.transposeSemitones !== 0 ? (
+                  <span className="lt-region-transpose-badge">
+                    {formatTransposeSemitones(region.transposeSemitones)} st
+                  </span>
+                ) : null}
                 <span className="lt-sr-only">{region.name}</span>
               </button>
             ))}

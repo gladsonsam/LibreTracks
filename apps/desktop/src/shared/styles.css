@@ -2634,6 +2634,24 @@ textarea {
   outline-offset: 1px;
 }
 
+.lt-region-transpose-badge {
+  position: absolute;
+  top: 0.12rem;
+  left: 0.14rem;
+  display: inline-flex;
+  align-items: center;
+  padding: 0.08rem 0.34rem;
+  border-radius: 999px;
+  background: rgb(12 12 18 / 0.82);
+  box-shadow: 0 0 0 1px rgb(255 226 171 / 0.24);
+  color: rgb(255 244 210);
+  font-size: 0.62rem;
+  font-weight: 700;
+  line-height: 1;
+  letter-spacing: 0.02em;
+  pointer-events: none;
+}
+
 .lt-marker-hotspot:focus-visible {
   outline: 1px solid rgb(255 226 171 / 0.88);
   outline-offset: 1px;

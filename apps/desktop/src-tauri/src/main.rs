@@ -74,6 +74,7 @@ fn main() {
             commands::project::create_song,
             commands::project::import_library_assets_from_dialog,
             commands::project::export_region_as_package,
+            commands::project::export_region_rendered_audio,
             commands::project::import_song_package,
             commands::project::import_song_package_from_base64,
             commands::project::import_song_package_from_bytes,
@@ -108,6 +109,7 @@ fn main() {
             commands::timeline::delete_section_marker,
             commands::timeline::create_song_region,
             commands::timeline::update_song_region,
+            commands::timeline::update_song_region_transpose,
             commands::timeline::delete_song_region,
             commands::timeline::assign_section_marker_digit,
             commands::timeline::update_song_tempo,
@@ -122,6 +124,7 @@ fn main() {
             commands::timeline::move_track,
             commands::timeline::update_track_mix_live,
             commands::timeline::update_track,
+            commands::timeline::update_track_transpose_enabled,
             commands::timeline::delete_track
         ])
         .run(tauri::generate_context!())

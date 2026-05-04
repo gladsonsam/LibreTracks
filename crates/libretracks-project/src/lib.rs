@@ -56,6 +56,7 @@ mod tests {
                 name: "Cancion".into(),
                 start_seconds: 0.0,
                 end_seconds: 240.0,
+                transpose_semitones: 0,
             }],
             tracks: vec![Track {
                 id: "track_click".into(),
@@ -66,6 +67,7 @@ mod tests {
                 pan: 0.0,
                 muted: false,
                 solo: false,
+                transpose_enabled: true,
                 audio_to: "ext:2-3".to_string(),
             }],
             clips: vec![Clip {
@@ -127,6 +129,16 @@ mod tests {
         assert!(json.contains("\"regions\""));
         assert!(json.contains("\"timelineStartSeconds\""));
         assert!(json.contains("\"sectionMarkers\""));
+    }
+
+    #[test]
+    fn roundtrips_region_and_track_transpose_defaults() {
+        let song = demo_song();
+        let json = serde_json::to_string(&song).expect("song should serialize");
+        let loaded: Song = serde_json::from_str(&json).expect("song should deserialize");
+
+        assert_eq!(loaded.regions[0].transpose_semitones, 0);
+        assert!(loaded.tracks[0].transpose_enabled);
     }
 
     #[test]

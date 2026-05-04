@@ -8,6 +8,10 @@ fn default_song_time_signature() -> String {
     "4/4".to_string()
 }
 
+fn default_true() -> bool {
+    true
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct Project {
@@ -55,6 +59,8 @@ pub struct SongRegion {
     pub name: String,
     pub start_seconds: f64,
     pub end_seconds: f64,
+    #[serde(default)]
+    pub transpose_semitones: i32,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -75,6 +81,8 @@ pub struct Track {
     pub pan: f64,
     pub muted: bool,
     pub solo: bool,
+    #[serde(default = "default_true")]
+    pub transpose_enabled: bool,
     #[serde(default = "default_audio_to", alias = "outputBusId")]
     pub audio_to: String,
 }

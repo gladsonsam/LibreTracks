@@ -4,6 +4,9 @@ use thiserror::Error;
 
 use crate::model::{Song, TrackKind};
 
+pub const MIN_TRANSPOSE_SEMITONES: i32 = -12;
+pub const MAX_TRANSPOSE_SEMITONES: i32 = 12;
+
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum DomainError {
     #[error("song must have a title")]
@@ -62,6 +65,11 @@ pub enum DomainError {
         marker_id: String,
         signature: String,
     },
+    #[error("region {region_id} has invalid transpose semitones {transpose_semitones}")]
+    InvalidRegionTranspose {
+        region_id: String,
+        transpose_semitones: i32,
+    },
 }
 
 pub fn validate_song(song: &Song) -> Result<(), DomainError> {
@@ -79,6 +87,15 @@ pub fn validate_song(song: &Song) -> Result<(), DomainError> {
         if region.start_seconds < 0.0 || region.end_seconds <= region.start_seconds {
             return Err(DomainError::InvalidRegionBounds {
                 region_id: region.id.clone(),
+            });
+        }
+
+        if !(MIN_TRANSPOSE_SEMITONES..=MAX_TRANSPOSE_SEMITONES)
+            .contains(&region.transpose_semitones)
+        {
+            return Err(DomainError::InvalidRegionTranspose {
+                region_id: region.id.clone(),
+                transpose_semitones: region.transpose_semitones,
             });
         }
 

@@ -1,5 +1,5 @@
 use super::*;
-use libretracks_core::{parse_audio_output_route, Track, TrackKind};
+use libretracks_core::{parse_audio_output_route, Clip, SongRegion, Track, TrackKind};
 use tauri::Emitter;
 
 const METRONOME_ACCENT_FREQUENCY_HZ: f32 = 1_000.0;
@@ -31,6 +31,7 @@ pub(crate) struct PlaybackClipPlan {
     pub(crate) fade_in_frames: u64,
     pub(crate) fade_out_frames: u64,
     pub(crate) source_start_seconds: f64,
+    pub(crate) transpose_semitones: i32,
 }
 
 pub(crate) struct Mixer {
@@ -232,6 +233,7 @@ impl Mixer {
         self.song = song;
         self.cached_live_mix = LiveMixSnapshot::from_song(&self.song);
         self.plans = build_playback_plans(&self.song_dir, &self.song, self.output_sample_rate);
+        self.refresh_active_clips_after_song_update();
         self.rebuild_track_meter_indices();
     }
 
@@ -421,6 +423,65 @@ impl Mixer {
                 }
             }
         }
+    }
+
+    fn refresh_active_clips_after_song_update(&mut self) {
+        let current_frame = self.timeline_cursor_frame;
+        let refreshed_song = self.song.clone();
+        let plans = self.plans.clone();
+        let live_mix_state = &self.cached_live_mix.tracks;
+        let is_any_track_soloed = self.cached_live_mix.is_any_track_soloed;
+        let mut refreshed_clips = Vec::with_capacity(self.active_clips.len());
+
+        for mut clip_state in self.active_clips.drain(..) {
+            let Some(next_plan) = plans.iter().find(|plan| {
+                plan.clip_id == clip_state.plan.clip_id
+                    && plan.timeline_start_frame == clip_state.plan.timeline_start_frame
+            }) else {
+                continue;
+            };
+
+            let next_plan = next_plan.clone();
+            let plan_changed = next_plan.transpose_semitones != clip_state.plan.transpose_semitones
+                || next_plan.source_start_seconds != clip_state.plan.source_start_seconds
+                || next_plan.duration_frames != clip_state.plan.duration_frames;
+            clip_state.plan = next_plan.clone();
+
+            if plan_changed {
+                if let Ok(reader) = source::StreamingClipReader::open(
+                    &next_plan,
+                    self.output_sample_rate,
+                    &self.audio_buffers,
+                    current_frame,
+                ) {
+                    clip_state.reader = reader;
+                }
+                clip_state.current_gain = resolve_clip_runtime_gain(
+                    live_mix_state,
+                    &clip_state.plan.track_id,
+                    clip_state.plan.clip_gain,
+                    is_any_track_soloed,
+                );
+                clip_state.current_pan = resolve_track_runtime_pan(live_mix_state, &clip_state.plan.track_id);
+            }
+
+            refreshed_clips.push(clip_state);
+        }
+
+        if refreshed_clips.len() != self.active_clips.len() {
+            self.needs_declick = true;
+        } else if refreshed_clips.iter().any(|clip_state| {
+            clip_state.plan.transpose_semitones != refreshed_song
+                .clips
+                .iter()
+                .find(|clip| clip.id == clip_state.plan.clip_id)
+                .map(|_| clip_state.plan.transpose_semitones)
+                .unwrap_or(clip_state.plan.transpose_semitones)
+        }) {
+            self.needs_declick = true;
+        }
+
+        self.active_clips = refreshed_clips;
     }
 
     fn rebuild_track_meter_indices(&mut self) {
@@ -886,29 +947,113 @@ pub(crate) fn build_playback_plans(
             continue;
         }
 
+        plans.extend(split_clip_by_region_boundaries(
+            song_dir,
+            song,
+            clip,
+            output_sample_rate,
+        ));
+    }
+
+    plans.sort_by_key(|plan| plan.timeline_start_frame);
+    plans
+}
+
+fn region_at_position(song: &Song, position_seconds: f64) -> Option<&SongRegion> {
+    song.regions.iter().find(|region| {
+        position_seconds >= region.start_seconds && position_seconds < region.end_seconds
+    })
+}
+
+fn effective_transpose_for_track_at_position(
+    song: &Song,
+    track_id: &str,
+    position_seconds: f64,
+) -> i32 {
+    let Some(track) = song.tracks.iter().find(|track| track.id == track_id) else {
+        return 0;
+    };
+
+    if !track.transpose_enabled {
+        return 0;
+    }
+
+    region_at_position(song, position_seconds)
+        .map(|region| region.transpose_semitones)
+        .unwrap_or(0)
+}
+
+fn split_clip_by_region_boundaries(
+    song_dir: &Path,
+    song: &Song,
+    clip: &Clip,
+    output_sample_rate: u32,
+) -> Vec<PlaybackClipPlan> {
+    let clip_start_seconds = clip.timeline_start_seconds.max(0.0);
+    let clip_end_seconds = (clip.timeline_start_seconds + clip.duration_seconds).max(clip_start_seconds);
+
+    let mut split_points = vec![clip_start_seconds, clip_end_seconds];
+    for region in &song.regions {
+        if region.start_seconds > clip_start_seconds && region.start_seconds < clip_end_seconds {
+            split_points.push(region.start_seconds);
+        }
+        if region.end_seconds > clip_start_seconds && region.end_seconds < clip_end_seconds {
+            split_points.push(region.end_seconds);
+        }
+    }
+
+    split_points.sort_by(|left, right| left.partial_cmp(right).unwrap_or(std::cmp::Ordering::Equal));
+    split_points.dedup_by(|left, right| (*left - *right).abs() <= f64::EPSILON);
+
+    let track = song.tracks.iter().find(|track| track.id == clip.track_id);
+    let transpose_enabled = track.map(|track| track.transpose_enabled).unwrap_or(true);
+    let clip_fade_in_frames = clip
+        .fade_in_seconds
+        .map(|seconds| seconds_to_frames(seconds, output_sample_rate))
+        .unwrap_or(0);
+    let clip_fade_out_frames = clip
+        .fade_out_seconds
+        .map(|seconds| seconds_to_frames(seconds, output_sample_rate))
+        .unwrap_or(0);
+
+    let mut plans = Vec::new();
+    for window in split_points.windows(2) {
+        let segment_start_seconds = window[0];
+        let segment_end_seconds = window[1];
+        if segment_end_seconds <= segment_start_seconds {
+            continue;
+        }
+
+        let segment_duration_seconds = segment_end_seconds - segment_start_seconds;
+        let segment_offset_seconds = (segment_start_seconds - clip_start_seconds).max(0.0);
+        let transpose_semitones = if transpose_enabled {
+            effective_transpose_for_track_at_position(song, &clip.track_id, segment_start_seconds)
+        } else {
+            0
+        };
+
         plans.push(PlaybackClipPlan {
             clip_id: clip.id.clone(),
             track_id: clip.track_id.clone(),
             file_path: source::resolve_clip_audio_path(song_dir, &clip.file_path),
             clip_gain: clip.gain as f32,
-            timeline_start_frame: seconds_to_frames(
-                clip.timeline_start_seconds,
-                output_sample_rate,
-            ),
-            duration_frames: seconds_to_frames(clip.duration_seconds, output_sample_rate),
-            fade_in_frames: clip
-                .fade_in_seconds
-                .map(|seconds| seconds_to_frames(seconds, output_sample_rate))
-                .unwrap_or(0),
-            fade_out_frames: clip
-                .fade_out_seconds
-                .map(|seconds| seconds_to_frames(seconds, output_sample_rate))
-                .unwrap_or(0),
-            source_start_seconds: clip.source_start_seconds,
+            timeline_start_frame: seconds_to_frames(segment_start_seconds, output_sample_rate),
+            duration_frames: seconds_to_frames(segment_duration_seconds, output_sample_rate),
+            fade_in_frames: if (segment_start_seconds - clip_start_seconds).abs() <= f64::EPSILON {
+                clip_fade_in_frames
+            } else {
+                0
+            },
+            fade_out_frames: if (segment_end_seconds - clip_end_seconds).abs() <= f64::EPSILON {
+                clip_fade_out_frames
+            } else {
+                0
+            },
+            source_start_seconds: clip.source_start_seconds + segment_offset_seconds,
+            transpose_semitones,
         });
     }
 
-    plans.sort_by_key(|plan| plan.timeline_start_frame);
     plans
 }
 
@@ -1379,7 +1524,7 @@ fn is_track_soloed_in_hierarchy(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use libretracks_core::{Marker, SongRegion, TempoMarker};
+    use libretracks_core::{Clip, Marker, SongRegion, TempoMarker};
 
     fn metronome_song() -> Song {
         Song {
@@ -1397,6 +1542,7 @@ mod tests {
                 name: "Song".into(),
                 start_seconds: 0.0,
                 end_seconds: 8.0,
+                transpose_semitones: 0,
             }],
             tracks: vec![Track {
                 id: "track".into(),
@@ -1407,6 +1553,7 @@ mod tests {
                 pan: 0.0,
                 muted: false,
                 solo: false,
+                transpose_enabled: true,
                 audio_to: "master".to_string(),
             }],
             clips: vec![],
@@ -1419,6 +1566,151 @@ mod tests {
         }
     }
 
+
+    #[test]
+    fn build_playback_plans_split_on_region_boundaries() {
+        let song = Song {
+            id: "song".into(),
+            title: "Split".into(),
+            artist: None,
+            key: None,
+            bpm: 120.0,
+            time_signature: "4/4".into(),
+            duration_seconds: 4.0,
+            tempo_markers: vec![],
+            time_signature_markers: vec![],
+            regions: vec![
+                SongRegion {
+                    id: "region_a".into(),
+                    name: "A".into(),
+                    start_seconds: 0.0,
+                    end_seconds: 2.0,
+                    transpose_semitones: 0,
+                },
+                SongRegion {
+                    id: "region_b".into(),
+                    name: "B".into(),
+                    start_seconds: 2.0,
+                    end_seconds: 4.0,
+                    transpose_semitones: 2,
+                },
+            ],
+            tracks: vec![Track {
+                id: "track".into(),
+                name: "Track".into(),
+                kind: TrackKind::Audio,
+                parent_track_id: None,
+                volume: 1.0,
+                pan: 0.0,
+                muted: false,
+                solo: false,
+                transpose_enabled: true,
+                audio_to: "master".to_string(),
+            }],
+            clips: vec![Clip {
+                id: "clip".into(),
+                track_id: "track".into(),
+                file_path: "audio/test.wav".into(),
+                timeline_start_seconds: 0.0,
+                source_start_seconds: 1.0,
+                duration_seconds: 4.0,
+                gain: 1.0,
+                fade_in_seconds: Some(0.5),
+                fade_out_seconds: Some(0.5),
+            }],
+            section_markers: vec![],
+        };
+
+        let plans = build_playback_plans(Path::new("song"), &song, 48_000);
+
+        assert_eq!(plans.len(), 2);
+        assert_eq!(plans[0].transpose_semitones, 0);
+        assert_eq!(plans[1].transpose_semitones, 2);
+        assert_eq!(plans[0].source_start_seconds, 1.0);
+        assert_eq!(plans[1].source_start_seconds, 3.0);
+    }
+
+    #[test]
+    fn apply_song_update_refreshes_active_clip_transpose() {
+        let song_dir = PathBuf::from("song");
+        let clip_path = "audio/test.wav".to_string();
+        let cache = AudioBufferCache::default();
+        cache.insert_for_test(
+            song_dir.join(&clip_path),
+            SharedAudioSource::from_preloaded(vec![0.0; 48_000 * 4], 48_000, 2, true),
+        );
+
+        let song = Song {
+            id: "song".into(),
+            title: "Update".into(),
+            artist: None,
+            key: None,
+            bpm: 120.0,
+            time_signature: "4/4".into(),
+            duration_seconds: 4.0,
+            tempo_markers: vec![],
+            time_signature_markers: vec![],
+            regions: vec![SongRegion {
+                id: "region_a".into(),
+                name: "A".into(),
+                start_seconds: 0.0,
+                end_seconds: 4.0,
+                transpose_semitones: 0,
+            }],
+            tracks: vec![Track {
+                id: "track".into(),
+                name: "Track".into(),
+                kind: TrackKind::Audio,
+                parent_track_id: None,
+                volume: 1.0,
+                pan: 0.0,
+                muted: false,
+                solo: false,
+                transpose_enabled: true,
+                audio_to: "master".to_string(),
+            }],
+            clips: vec![Clip {
+                id: "clip".into(),
+                track_id: "track".into(),
+                file_path: clip_path,
+                timeline_start_seconds: 0.0,
+                source_start_seconds: 0.0,
+                duration_seconds: 4.0,
+                gain: 1.0,
+                fade_in_seconds: None,
+                fade_out_seconds: None,
+            }],
+            section_markers: vec![],
+        };
+
+        let app_handle = Arc::new(RwLock::new(None));
+        let remote_handle = Arc::new(RwLock::new(None));
+        let live_mix_state = Arc::new(RwLock::new(HashMap::new()));
+        let audio_settings = Arc::new(RwLock::new(AppSettings::default()));
+        let mut mixer = Mixer::new(
+            song_dir.clone(),
+            song.clone(),
+            0.0,
+            48_000,
+            2,
+            app_handle,
+            remote_handle,
+            live_mix_state,
+            audio_settings,
+            telemetry::AudioDebugConfig::from_env(),
+            cache,
+        );
+
+        assert_eq!(mixer.active_clips().len(), 1);
+        assert_eq!(mixer.active_clips()[0].plan().transpose_semitones, 0);
+
+        let mut updated_song = song;
+        updated_song.regions[0].transpose_semitones = 4;
+        mixer.apply_song_update(updated_song);
+
+        assert_eq!(mixer.active_clips().len(), 1);
+        assert_eq!(mixer.active_clips()[0].plan().transpose_semitones, 4);
+    }
     #[test]
     fn metronome_events_follow_base_bpm_grid() {
         let song = metronome_song();
@@ -1485,6 +1777,7 @@ mod tests {
                 pan: 0.0,
                 muted: false,
                 solo: false,
+                transpose_enabled: true,
                 audio_to: "ext:2-3".to_string(),
             },
             Track {
@@ -1496,6 +1789,7 @@ mod tests {
                 pan: 0.0,
                 muted: false,
                 solo: false,
+                transpose_enabled: true,
                 audio_to: "ext:4-5".to_string(),
             },
             Track {
@@ -1507,6 +1801,7 @@ mod tests {
                 pan: 0.0,
                 muted: false,
                 solo: false,
+                transpose_enabled: true,
                 audio_to: "master".to_string(),
             },
         ];

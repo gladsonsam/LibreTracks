@@ -5,7 +5,7 @@ pub use model::{
     default_audio_to, parse_audio_output_route, Clip, Marker, Project, Song, SongRegion,
     TempoMarker, TempoMetadata, TempoSource, TimeSignatureMarker, Track, TrackKind,
 };
-pub use validation::{validate_song, DomainError};
+pub use validation::{validate_song, DomainError, MAX_TRANSPOSE_SEMITONES, MIN_TRANSPOSE_SEMITONES};
 
 #[cfg(test)]
 mod tests {
@@ -27,6 +27,7 @@ mod tests {
                 name: "Cancion".into(),
                 start_seconds: 0.0,
                 end_seconds: 240.0,
+                transpose_semitones: 0,
             }],
             tracks: vec![
                 Track {
@@ -38,6 +39,7 @@ mod tests {
                     pan: 0.0,
                     muted: false,
                     solo: false,
+                    transpose_enabled: true,
                     audio_to: "master".into(),
                 },
                 Track {
@@ -49,6 +51,7 @@ mod tests {
                     pan: 0.0,
                     muted: false,
                     solo: false,
+                    transpose_enabled: true,
                     audio_to: "ext:2-3".into(),
                 },
             ],
@@ -119,6 +122,48 @@ mod tests {
         assert!(json.contains("\"kind\": \"audio\""));
         assert!(json.contains("\"regions\""));
         assert!(json.contains("\"sectionMarkers\""));
+    }
+
+    #[test]
+    fn deserializes_legacy_region_and_track_defaults() {
+        let json = r#"{
+            "id":"song_legacy",
+            "title":"Legacy",
+            "artist":null,
+            "key":null,
+            "bpm":120,
+            "timeSignature":"4/4",
+            "durationSeconds":60,
+            "tempoMarkers":[],
+            "timeSignatureMarkers":[],
+            "regions":[{"id":"region_1","name":"Legacy","startSeconds":0,"endSeconds":60}],
+            "tracks":[{"id":"track_1","name":"Track","kind":"audio","parentTrackId":null,"volume":1,"pan":0,"muted":false,"solo":false,"audioTo":"master"}],
+            "clips":[],
+            "sectionMarkers":[]
+        }"#;
+
+        let song: Song = serde_json::from_str(json).expect("song should deserialize");
+
+        assert_eq!(song.regions[0].transpose_semitones, 0);
+        assert!(song.tracks[0].transpose_enabled);
+    }
+
+    #[test]
+    fn validates_region_transpose_range() {
+        let mut song = valid_song();
+        song.regions[0].transpose_semitones = MIN_TRANSPOSE_SEMITONES;
+        assert!(validate_song(&song).is_ok());
+
+        song.regions[0].transpose_semitones = MAX_TRANSPOSE_SEMITONES;
+        assert!(validate_song(&song).is_ok());
+
+        song.regions[0].transpose_semitones = MIN_TRANSPOSE_SEMITONES - 1;
+        let error = validate_song(&song).expect_err("song should be invalid");
+        assert!(error.to_string().contains("invalid transpose semitones"));
+
+        song.regions[0].transpose_semitones = MAX_TRANSPOSE_SEMITONES + 1;
+        let error = validate_song(&song).expect_err("song should be invalid");
+        assert!(error.to_string().contains("invalid transpose semitones"));
     }
 
     #[test]

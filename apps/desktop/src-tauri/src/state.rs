@@ -5,12 +5,13 @@ use std::{
     path::PathBuf,
     sync::{mpsc, Arc, Mutex},
     thread,
-    time::{Instant, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use libretracks_audio::{AudioEngine, JumpTrigger, PlaybackState, TransitionType, VampMode};
 use libretracks_core::{
     Clip, Marker, Song, SongRegion, TempoMarker, TimeSignatureMarker, Track, TrackKind,
+    MAX_TRANSPOSE_SEMITONES, MIN_TRANSPOSE_SEMITONES,
 };
 use libretracks_project::{
     append_wav_files_to_song, generate_waveform_summary,
@@ -98,8 +99,21 @@ pub struct DesktopSession {
     undo_stack: Vec<Song>,
     redo_stack: Vec<Song>,
     live_history_anchor: Option<Song>,
+    transpose_history_group: Option<TransposeHistoryGroup>,
     waveform_cache: WaveformMemoryCache,
     perf_metrics: DesktopPerformanceMetrics,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum TransposeHistoryTarget {
+    Region(String),
+    Track(String),
+}
+
+#[derive(Debug, Clone)]
+struct TransposeHistoryGroup {
+    target: TransposeHistoryTarget,
+    recorded_at: Instant,
 }
 
 #[derive(Debug, Default)]
@@ -123,6 +137,7 @@ impl Default for DesktopSession {
             undo_stack: Vec::new(),
             redo_stack: Vec::new(),
             live_history_anchor: None,
+            transpose_history_group: None,
             waveform_cache: WaveformMemoryCache::default(),
             perf_metrics: DesktopPerformanceMetrics::default(),
         }
@@ -1481,6 +1496,7 @@ impl DesktopSession {
             name: region_name,
             start_seconds,
             end_seconds,
+            transpose_semitones: 0,
         };
 
         replace_song_region_range(&mut song, region);
@@ -1522,10 +1538,86 @@ impl DesktopSession {
             name: trimmed_name.to_string(),
             start_seconds,
             end_seconds,
+            transpose_semitones: existing_region.transpose_semitones,
         };
 
         replace_song_region_range(&mut song, updated_region);
         self.persist_song_update(song, audio, AudioChangeImpact::TransportOnly, true)?;
+
+        Ok(self.snapshot())
+    }
+
+    pub fn update_song_region_transpose(
+        &mut self,
+        region_id: &str,
+        transpose_semitones: i32,
+        audio: &AudioController,
+    ) -> Result<TransportSnapshot, DesktopError> {
+        if !(MIN_TRANSPOSE_SEMITONES..=MAX_TRANSPOSE_SEMITONES).contains(&transpose_semitones) {
+            return Err(DesktopError::AudioCommand(format!(
+                "transpose semitones must be between {} and {}",
+                MIN_TRANSPOSE_SEMITONES, MAX_TRANSPOSE_SEMITONES
+            )));
+        }
+
+        let mut song = self
+            .engine
+            .song()
+            .cloned()
+            .ok_or(DesktopError::NoSongLoaded)?;
+        let region = song
+            .regions
+            .iter_mut()
+            .find(|region| region.id == region_id)
+            .ok_or_else(|| DesktopError::RegionNotFound(region_id.to_string()))?;
+
+        let record_history = self.should_record_transpose_history(TransposeHistoryTarget::Region(
+            region.id.clone(),
+        ));
+
+        region.transpose_semitones = transpose_semitones;
+
+        self.persist_song_update_internal(
+            song,
+            audio,
+            AudioChangeImpact::TransportOnly,
+            record_history,
+            true,
+        )?;
+
+        Ok(self.snapshot())
+    }
+
+    pub fn update_track_transpose_enabled(
+        &mut self,
+        track_id: &str,
+        transpose_enabled: bool,
+        audio: &AudioController,
+    ) -> Result<TransportSnapshot, DesktopError> {
+        let mut song = self
+            .engine
+            .song()
+            .cloned()
+            .ok_or(DesktopError::NoSongLoaded)?;
+        let track = song
+            .tracks
+            .iter_mut()
+            .find(|track| track.id == track_id)
+            .ok_or_else(|| DesktopError::TrackNotFound(track_id.to_string()))?;
+
+        let record_history = self.should_record_transpose_history(TransposeHistoryTarget::Track(
+            track.id.clone(),
+        ));
+
+        track.transpose_enabled = transpose_enabled;
+
+        self.persist_song_update_internal(
+            song,
+            audio,
+            AudioChangeImpact::TransportOnly,
+            record_history,
+            true,
+        )?;
 
         Ok(self.snapshot())
     }
@@ -1900,6 +1992,7 @@ impl DesktopSession {
             pan: 0.0,
             muted: false,
             solo: false,
+            transpose_enabled: true,
             audio_to,
         };
 
@@ -2206,6 +2299,10 @@ impl DesktopSession {
             .ok_or(DesktopError::NoSongLoaded)?;
         audio.sync_live_mix(&loaded_song)?;
 
+        if playback_state == PlaybackState::Playing && matches!(impact, AudioChangeImpact::TransportOnly) {
+            audio.sync_song(loaded_song.clone())?;
+        }
+
         if let Some(pending_jump) = pending_jump {
             if loaded_song
                 .marker_by_id(&pending_jump.target_marker_id)
@@ -2270,6 +2367,24 @@ impl DesktopSession {
         }
     }
 
+    fn should_record_transpose_history(&mut self, target: TransposeHistoryTarget) -> bool {
+        let now = Instant::now();
+        let should_group = self
+            .transpose_history_group
+            .as_ref()
+            .is_some_and(|group| {
+                group.target == target
+                    && now.duration_since(group.recorded_at) <= Duration::from_millis(750)
+            });
+
+        self.transpose_history_group = Some(TransposeHistoryGroup {
+            target,
+            recorded_at: now,
+        });
+
+        !should_group
+    }
+
     fn update_loaded_track(
         &mut self,
         track_id: &str,
@@ -2323,6 +2438,8 @@ impl DesktopSession {
             };
         }
 
+        self.transpose_history_group = None;
+
         Ok(())
     }
 
@@ -2331,6 +2448,7 @@ impl DesktopSession {
         audio: &AudioController,
     ) -> Result<TransportSnapshot, DesktopError> {
         self.live_history_anchor = None;
+        self.transpose_history_group = None;
         let Some(previous_song) = self.undo_stack.pop() else {
             return Ok(self.snapshot());
         };
@@ -2358,6 +2476,7 @@ impl DesktopSession {
         audio: &AudioController,
     ) -> Result<TransportSnapshot, DesktopError> {
         self.live_history_anchor = None;
+        self.transpose_history_group = None;
         let Some(next_song) = self.redo_stack.pop() else {
             return Ok(self.snapshot());
         };
@@ -3469,6 +3588,7 @@ fn replace_song_region_range(song: &mut Song, replacement: SongRegion) {
                 name: region.name.clone(),
                 start_seconds: region.start_seconds,
                 end_seconds: replacement.start_seconds,
+                transpose_semitones: region.transpose_semitones,
             });
         }
 
@@ -3484,6 +3604,7 @@ fn replace_song_region_range(song: &mut Song, replacement: SongRegion) {
                 name: region.name.clone(),
                 start_seconds: replacement.end_seconds,
                 end_seconds: region.end_seconds,
+                transpose_semitones: region.transpose_semitones,
             });
         }
     }
@@ -3655,6 +3776,7 @@ mod tests {
                 name: "Move Demo".into(),
                 start_seconds: 0.0,
                 end_seconds: 12.0,
+                transpose_semitones: 0,
             }],
             tracks: vec![Track {
                 id: "track_1".into(),
@@ -3665,6 +3787,7 @@ mod tests {
                 pan: 0.0,
                 muted: false,
                 solo: false,
+                transpose_enabled: true,
                 audio_to: "master".to_string(),
             }],
             clips: vec![Clip {
@@ -3768,18 +3891,21 @@ mod tests {
                 name: "Intro".into(),
                 start_seconds: 0.0,
                 end_seconds: 8.0,
+                transpose_semitones: 0,
             },
             SongRegion {
                 id: "region_2".into(),
                 name: "Bridge".into(),
                 start_seconds: 8.0,
                 end_seconds: 14.0,
+                transpose_semitones: 0,
             },
             SongRegion {
                 id: "region_3".into(),
                 name: "Outro".into(),
                 start_seconds: 14.0,
                 end_seconds: 18.0,
+                transpose_semitones: 0,
             },
         ];
         song.clips[0].duration_seconds = 18.0;
@@ -3852,6 +3978,7 @@ mod tests {
                 name: "Hierarchy Demo".into(),
                 start_seconds: 0.0,
                 end_seconds: 12.0,
+                transpose_semitones: 0,
             }],
             tracks: vec![
                 Track {
@@ -3863,6 +3990,7 @@ mod tests {
                     pan: 0.0,
                     muted: false,
                     solo: false,
+                    transpose_enabled: true,
                     audio_to: "master".to_string(),
                 },
                 Track {
@@ -3874,6 +4002,7 @@ mod tests {
                     pan: 0.0,
                     muted: false,
                     solo: false,
+                    transpose_enabled: true,
                     audio_to: "master".to_string(),
                 },
                 Track {
@@ -3885,6 +4014,7 @@ mod tests {
                     pan: 0.0,
                     muted: false,
                     solo: false,
+                    transpose_enabled: true,
                     audio_to: "master".to_string(),
                 },
                 Track {
@@ -3896,6 +4026,7 @@ mod tests {
                     pan: 0.0,
                     muted: false,
                     solo: false,
+                    transpose_enabled: true,
                     audio_to: "master".to_string(),
                 },
             ],
@@ -4126,6 +4257,7 @@ mod tests {
                 name: "ID Audit".into(),
                 start_seconds: 0.0,
                 end_seconds: 8.0,
+                transpose_semitones: 0,
             }],
             tracks: vec![
                 Track {
@@ -4137,6 +4269,7 @@ mod tests {
                     pan: 0.0,
                     muted: false,
                     solo: false,
+                    transpose_enabled: true,
                     audio_to: "master".to_string(),
                 },
                 Track {
@@ -4148,6 +4281,7 @@ mod tests {
                     pan: 0.0,
                     muted: false,
                     solo: false,
+                    transpose_enabled: true,
                     audio_to: "master".to_string(),
                 },
             ],
@@ -4391,6 +4525,33 @@ mod tests {
         assert_eq!(track.pan, 0.0);
         assert!(!track.muted);
         assert!(!track.solo);
+    }
+
+    #[test]
+    fn repeated_region_transpose_changes_group_into_one_undo_entry() {
+        let mut session = session_with_song_dir("transpose-undo-demo", demo_song());
+        let audio = crate::audio_runtime::AudioController::default();
+
+        session
+            .update_song_region_transpose("region_1", 1, &audio)
+            .expect("first transpose change should succeed");
+        session
+            .update_song_region_transpose("region_1", 2, &audio)
+            .expect("second transpose change should succeed");
+
+        assert_eq!(session.undo_stack.len(), 1);
+
+        session.undo_action(&audio).expect("undo should succeed");
+        let region = session
+            .song_view()
+            .expect("song view should build")
+            .expect("song view should exist")
+            .regions
+            .into_iter()
+            .find(|region| region.id == "region_1")
+            .expect("region should exist after undo");
+
+        assert_eq!(region.transpose_semitones, 0);
     }
 
     #[test]

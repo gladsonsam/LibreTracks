@@ -235,6 +235,7 @@ pub fn import_wav_song(
             name: request.title.clone(),
             start_seconds: 0.0,
             end_seconds: duration_seconds,
+            transpose_semitones: 0,
         }],
         tracks: imported_files
             .iter()
@@ -247,6 +248,7 @@ pub fn import_wav_song(
                 pan: 0.0,
                 muted: false,
                 solo: false,
+                transpose_enabled: true,
                 audio_to: "master".to_string(),
             })
             .collect(),
@@ -323,6 +325,7 @@ pub fn append_wav_files_to_song(
             pan: 0.0,
             muted: false,
             solo: false,
+            transpose_enabled: true,
             audio_to: "master".to_string(),
         });
 

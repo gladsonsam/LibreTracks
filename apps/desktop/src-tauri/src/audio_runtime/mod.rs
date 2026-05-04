@@ -1,5 +1,6 @@
 mod backend;
 mod mixer;
+mod pitch;
 mod source;
 mod telemetry;
 
@@ -495,6 +496,71 @@ impl AudioController {
         self.audio_buffers
             .replace_song_buffers(song_dir, song)
             .map_err(DesktopError::AudioCommand)
+    }
+
+    pub fn export_region_rendered_audio(
+        &self,
+        song_dir: PathBuf,
+        song: Song,
+        region_id: &str,
+        output_path: &Path,
+    ) -> Result<(), DesktopError> {
+        self.replace_song_buffers(&song_dir, &song)?;
+
+        let region = song
+            .regions
+            .iter()
+            .find(|region| region.id == region_id)
+            .cloned()
+            .ok_or_else(|| DesktopError::RegionNotFound(region_id.to_string()))?;
+
+        let render_live_mix_state = Arc::new(RwLock::new(HashMap::new()));
+        let render_app_handle = Arc::new(RwLock::new(None));
+        let render_remote_handle = Arc::new(RwLock::new(None));
+        let render_audio_settings = Arc::new(RwLock::new(self.current_settings()?));
+        let mut mixer = Mixer::new(
+            song_dir,
+            song,
+            region.start_seconds,
+            48_000,
+            2,
+            render_app_handle,
+            render_remote_handle,
+            render_live_mix_state,
+            render_audio_settings,
+            AudioDebugConfig::from_env(),
+            self.audio_buffers.clone(),
+        );
+
+        let total_frames = seconds_to_frames(
+            (region.end_seconds - region.start_seconds).max(0.0),
+            mixer.output_sample_rate,
+        ) as usize;
+        let spec = hound::WavSpec {
+            channels: mixer.output_channels.max(1) as u16,
+            sample_rate: mixer.output_sample_rate.max(1),
+            bits_per_sample: 16,
+            sample_format: hound::SampleFormat::Int,
+        };
+        let mut writer = hound::WavWriter::create(output_path, spec)
+            .map_err(|error| DesktopError::AudioCommand(error.to_string()))?;
+
+        let mut remaining_frames = total_frames;
+        while remaining_frames > 0 {
+            let block_frames = remaining_frames.min(DISK_RENDER_BLOCK_FRAMES);
+            let block = mixer.render_next_block(block_frames);
+            for sample in block {
+                writer
+                    .write_sample((sample.clamp(-1.0, 1.0) * i16::MAX as f32) as i16)
+                    .map_err(|error| DesktopError::AudioCommand(error.to_string()))?;
+            }
+            remaining_frames -= block_frames;
+        }
+
+        writer
+            .finalize()
+            .map_err(|error| DesktopError::AudioCommand(error.to_string()))?;
+        Ok(())
     }
 
     fn request(
@@ -1078,10 +1144,11 @@ mod tests {
         drain_consumer_samples, env_flag, interpolated_gain, playback_reason_label,
         prepare_audio_source, probe_audio_file, resolve_track_runtime_pan, scheduled_clip_count,
         update_shared_track_mix, AudioBufferCache, AudioBufferCacheStats, AudioCommand,
-        AudioCommandKind, AudioDebugConfig, AudioDebugSnapshot, AudioDebugState, AudioMeterLevel,
-        DiskReaderState, MemoryClipReader, Mixer, OutputSample, PlaybackBackend, PlaybackClipPlan,
-        PlaybackSession, PlaybackStartReason, ReaderCommand, RestartReport, SharedAudioSource,
-        StopReport, SyncReport, DISK_RENDER_BLOCK_FRAMES, GAIN_EPSILON, STOP_FADE_DURATION_SECONDS,
+        AudioCommandKind, AudioController, AudioDebugConfig, AudioDebugSnapshot, AudioDebugState,
+        AudioMeterLevel, DiskReaderState, MemoryClipReader, Mixer, OutputSample, PlaybackBackend,
+        PlaybackClipPlan, PlaybackSession, PlaybackStartReason, ReaderCommand, RestartReport,
+        SharedAudioSource, StopReport, SyncReport, DISK_RENDER_BLOCK_FRAMES, GAIN_EPSILON,
+        STOP_FADE_DURATION_SECONDS,
     };
 
     fn demo_song() -> Song {
@@ -1100,6 +1167,7 @@ mod tests {
                 name: "Audio Runtime".into(),
                 start_seconds: 0.0,
                 end_seconds: 20.0,
+                transpose_semitones: 0,
             }],
             tracks: vec![
                 Track {
@@ -1111,6 +1179,7 @@ mod tests {
                     pan: 0.0,
                     muted: false,
                     solo: false,
+                    transpose_enabled: true,
                     audio_to: "master".to_string(),
                 },
                 Track {
@@ -1122,6 +1191,7 @@ mod tests {
                     pan: 0.0,
                     muted: false,
                     solo: false,
+                    transpose_enabled: true,
                     audio_to: "master".to_string(),
                 },
             ],
@@ -1511,6 +1581,7 @@ mod tests {
             fade_in_frames: 20,
             fade_out_frames: 20,
             source_start_seconds: 0.0,
+            transpose_semitones: 0,
         };
 
         assert!((plan.edge_gain(0) - 0.0).abs() < 0.000_001);
@@ -1534,6 +1605,7 @@ mod tests {
                 fade_in_frames: 0,
                 fade_out_frames: 0,
                 source_start_seconds: 0.0,
+                transpose_semitones: 0,
             },
             48_000,
             &cache,
@@ -1564,6 +1636,7 @@ mod tests {
                 fade_in_frames: 0,
                 fade_out_frames: 0,
                 source_start_seconds: 0.0,
+                transpose_semitones: 0,
             },
             48_000,
             &cache,
@@ -1612,6 +1685,7 @@ mod tests {
                 fade_in_frames: 0,
                 fade_out_frames: 0,
                 source_start_seconds: 0.0,
+                transpose_semitones: 0,
             },
             48_000,
             &cache,
@@ -1653,6 +1727,7 @@ mod tests {
                 name: "Cycle".into(),
                 start_seconds: 0.0,
                 end_seconds: 1.0,
+                transpose_semitones: 0,
             }],
             tracks: vec![
                 Track {
@@ -1664,6 +1739,7 @@ mod tests {
                     pan: 0.25,
                     muted: false,
                     solo: false,
+                    transpose_enabled: true,
                     audio_to: "master".to_string(),
                 },
                 Track {
@@ -1675,6 +1751,7 @@ mod tests {
                     pan: 0.25,
                     muted: false,
                     solo: false,
+                    transpose_enabled: true,
                     audio_to: "master".to_string(),
                 },
                 Track {
@@ -1686,6 +1763,7 @@ mod tests {
                     pan: 0.25,
                     muted: false,
                     solo: false,
+                    transpose_enabled: true,
                     audio_to: "master".to_string(),
                 },
             ],
@@ -1850,6 +1928,7 @@ mod tests {
                 fade_in_frames: 0,
                 fade_out_frames: 0,
                 source_start_seconds: 0.0,
+                transpose_semitones: 0,
             },
             48_000,
             &cache,
@@ -1881,6 +1960,7 @@ mod tests {
                 fade_in_frames: 0,
                 fade_out_frames: 0,
                 source_start_seconds: 0.5,
+                transpose_semitones: 0,
             },
             4,
             &cache,
@@ -1946,6 +2026,7 @@ mod tests {
                 fade_in_frames: 0,
                 fade_out_frames: 0,
                 source_start_seconds: 0.0,
+                transpose_semitones: 0,
             },
             8_000,
             &cache,
@@ -1955,12 +2036,104 @@ mod tests {
 
         reader.seek_to(8_000 * 2 + 32);
         let mut mixed = [0.0_f32; 260];
-        let (_left_peak, right_peak) =
-            reader.mix_into_with_channel_gains(&mut mixed, 0, 260, 1, 1.0, 0.0);
+        let (_left_peak, right_peak) = reader.mix_into_with_channel_gains(&mut mixed, 0, 260, 1, 1.0, 0.0);
 
         assert!(mixed.iter().any(|sample| sample.abs() > 0.01));
         assert!(right_peak.abs() > 0.01);
         assert!(!reader.shared_source().has_mapped_audio());
+    }
+
+    #[test]
+    fn rendered_region_export_changes_with_transpose() {
+        let root = tempdir().expect("temp dir should exist");
+        let song_dir = root.path().to_path_buf();
+        let audio_path = song_dir.join("audio/phrase.wav");
+        if let Some(parent) = audio_path.parent() {
+            fs::create_dir_all(parent).expect("audio directory should exist");
+        }
+
+        let mut samples = Vec::with_capacity(48_000 * 4 * 2);
+        for frame in 0..(48_000 * 4) {
+            let value = ((frame as f32) / 97.0).sin() * 0.5;
+            samples.push(value);
+            samples.push(-value);
+        }
+
+        let controller = AudioController::default();
+        controller.audio_buffers.insert_for_test(
+            audio_path.clone(),
+            SharedAudioSource::from_preloaded(samples, 48_000, 2, true),
+        );
+
+        let base_song = Song {
+            id: "song_render".into(),
+            title: "Rendered Export".into(),
+            artist: None,
+            key: None,
+            bpm: 120.0,
+            time_signature: "4/4".into(),
+            duration_seconds: 4.0,
+            tempo_markers: vec![],
+            time_signature_markers: vec![],
+            regions: vec![SongRegion {
+                id: "region_render".into(),
+                name: "Render Region".into(),
+                start_seconds: 0.0,
+                end_seconds: 4.0,
+                transpose_semitones: 0,
+            }],
+            tracks: vec![Track {
+                id: "track_render".into(),
+                name: "Track".into(),
+                kind: libretracks_core::TrackKind::Audio,
+                parent_track_id: None,
+                volume: 1.0,
+                pan: 0.0,
+                muted: false,
+                solo: false,
+                transpose_enabled: true,
+                audio_to: "master".to_string(),
+            }],
+            clips: vec![Clip {
+                id: "clip_render".into(),
+                track_id: "track_render".into(),
+                file_path: "audio/phrase.wav".into(),
+                timeline_start_seconds: 0.0,
+                source_start_seconds: 0.0,
+                duration_seconds: 4.0,
+                gain: 1.0,
+                fade_in_seconds: None,
+                fade_out_seconds: None,
+            }],
+            section_markers: vec![],
+        };
+
+        let flat_path = song_dir.join("flat.wav");
+        controller
+            .export_region_rendered_audio(song_dir.clone(), base_song.clone(), "region_render", &flat_path)
+            .expect("flat export should succeed");
+
+        let mut transposed_song = base_song;
+        transposed_song.regions[0].transpose_semitones = 5;
+        let transposed_path = song_dir.join("transposed.wav");
+        controller
+            .export_region_rendered_audio(song_dir, transposed_song, "region_render", &transposed_path)
+            .expect("transposed export should succeed");
+
+        let read_samples = |path: &Path| -> Vec<i16> {
+            hound::WavReader::open(path)
+                .expect("rendered wav should open")
+                .into_samples::<i16>()
+                .map(|sample| sample.expect("sample should decode"))
+                .collect()
+        };
+
+        let flat_samples = read_samples(&flat_path);
+        let transposed_samples = read_samples(&transposed_path);
+
+        assert!(!flat_samples.is_empty());
+        assert_eq!(flat_samples.len(), transposed_samples.len());
+        assert_ne!(flat_samples, transposed_samples);
     }
 
     #[test]

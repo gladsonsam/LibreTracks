@@ -78,6 +78,7 @@ pub struct SongRegionSummary {
     pub name: String,
     pub start_seconds: f64,
     pub end_seconds: f64,
+    pub transpose_semitones: i32,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -109,6 +110,7 @@ pub struct TrackSummary {
     pub pan: f64,
     pub muted: bool,
     pub solo: bool,
+    pub transpose_enabled: bool,
     pub audio_to: String,
 }
 
@@ -259,6 +261,7 @@ pub(crate) fn song_to_view(
                 pan: track.pan,
                 muted: track.muted,
                 solo: track.solo,
+                transpose_enabled: track.transpose_enabled,
                 audio_to: track.audio_to.clone(),
             })
             .collect(),
@@ -376,6 +379,7 @@ pub(crate) fn region_to_summary(region: &SongRegion) -> SongRegionSummary {
         name: region.name.clone(),
         start_seconds: region.start_seconds,
         end_seconds: region.end_seconds,
+        transpose_semitones: region.transpose_semitones,
     }
 }
 

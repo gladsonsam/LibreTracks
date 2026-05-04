@@ -210,6 +210,50 @@ pub async fn export_region_as_package(
 }
 
 #[tauri::command]
+pub fn export_region_rendered_audio(
+    region_id: String,
+    state: State<'_, DesktopState>,
+) -> Result<(), String> {
+    let (song_dir, song, region_name) = {
+        let session = state
+            .session
+            .lock()
+            .map_err(|_| DesktopError::StatePoisoned.to_string())?;
+        let song_dir = session
+            .song_dir
+            .clone()
+            .ok_or_else(|| "No song loaded".to_string())?;
+        let song = session
+            .engine
+            .song()
+            .cloned()
+            .ok_or_else(|| "No song loaded".to_string())?;
+        let region_name = song
+            .regions
+            .iter()
+            .find(|region| region.id == region_id)
+            .map(|region| region.name.clone())
+            .ok_or_else(|| "Region not found".to_string())?;
+        (song_dir, song, region_name)
+    };
+
+    let output_path = FileDialog::new()
+        .add_filter("Wave Audio", &["wav"])
+        .set_title("Exportar Audio Renderizado")
+        .set_file_name(&format!("{}.wav", crate::state::slugify(&region_name)))
+        .save_file();
+
+    if let Some(path) = output_path {
+        state
+            .audio
+            .export_region_rendered_audio(song_dir, song, &region_id, &path)
+            .map_err(|error| error.to_string())?;
+    }
+
+    Ok(())
+}
+
+#[tauri::command]
 pub fn import_song_package(
     package_path: String,
     insert_at_seconds: f64,
