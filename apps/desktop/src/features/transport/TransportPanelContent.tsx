@@ -519,17 +519,15 @@ function toClientPointFromNativePosition(position: { x: number; y: number }) {
 }
 
 function nativeClientPointCandidates(position: { x: number; y: number }) {
-  const scaledPoint = toClientPointFromNativePosition(position);
-
-  if (scaledPoint.clientX === position.x && scaledPoint.clientY === position.y) {
-    return [scaledPoint];
-  }
-
+  const scaleFactor = window.devicePixelRatio || 1;
   return [
-    scaledPoint,
     {
       clientX: position.x,
       clientY: position.y,
+    },
+    {
+      clientX: position.x / scaleFactor,
+      clientY: position.y / scaleFactor,
     },
   ];
 }
@@ -1083,25 +1081,20 @@ export function TransportPanelContent() {
 
     void getCurrentWebview()
       .onDragDropEvent((event) => {
-        if (event.type === "enter") {
+        const payload = event.payload;
+
+        if (payload.type === "over") {
           handleNativeFileDragOver({
-            paths: event.paths,
-            position: event.position,
+            paths: payload.paths,
+            position: payload.position,
           });
           return;
         }
 
-        if (event.type === "over") {
-          handleNativeFileDragOver({
-            position: event.position,
-          });
-          return;
-        }
-
-        if (event.type === "drop") {
+        if (payload.type === "drop") {
           handleNativeFileDrop({
-            paths: event.paths,
-            position: event.position,
+            paths: payload.paths,
+            position: payload.position,
           });
           return;
         }
@@ -1117,7 +1110,8 @@ export function TransportPanelContent() {
 
         unlisten = dispose;
       })
-      .catch(() => {
+      .catch((error) => {
+        console.error("[native-dnd] failed to register drag/drop listener", error);
         nativeExternalDropPathsRef.current = [];
         setExternalDropPreview(null);
       });
@@ -5919,17 +5913,21 @@ export function TransportPanelContent() {
   }
 
   function handleNativeFileDragOver(args: { paths?: string[]; position: { x: number; y: number } }) {
+    console.debug("[native-dnd] over", args);
+
     if (args.paths?.length) {
       nativeExternalDropPathsRef.current = args.paths;
     }
 
     const paths = args.paths?.length ? args.paths : nativeExternalDropPathsRef.current;
     if (!paths.length) {
+      console.debug("[native-dnd] over ignored: no paths");
       setExternalDropPreview(null);
       return;
     }
 
     const hit = resolveTimelineDropFromNativePosition(args.position);
+    console.debug("[native-dnd] over hit", hit);
     if (!hit.isOverTimeline) {
       setExternalDropPreview(null);
       return;
@@ -5943,6 +5941,8 @@ export function TransportPanelContent() {
   }
 
   function handleNativeFileDrop(args: { paths: string[]; position: { x: number; y: number } }) {
+    console.debug("[native-dnd] drop", args);
+
     nativeExternalDropPathsRef.current = [];
 
     if (!args.paths.length) {
@@ -5951,6 +5951,7 @@ export function TransportPanelContent() {
     }
 
     const hit = resolveTimelineDropFromNativePosition(args.position);
+    console.debug("[native-dnd] drop hit", hit);
     if (!hit.isOverTimeline) {
       setExternalDropPreview(null);
       return;

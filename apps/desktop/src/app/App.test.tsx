@@ -14,10 +14,15 @@ import { App } from "./App";
 import { emitWaveformReadyForTest, resetTestDesktopApiMock, testDesktopApiMock } from "./testDesktopApiMock";
 
 type MockWebviewDragDropEvent =
-  | { type: "enter"; paths: string[]; position: { x: number; y: number } }
-  | { type: "over"; position: { x: number; y: number } }
-  | { type: "drop"; paths: string[]; position: { x: number; y: number } }
-  | { type: "leave" };
+  | {
+      payload:
+        | { type: "over"; paths: string[]; position: { x: number; y: number } }
+        | { type: "drop"; paths: string[]; position: { x: number; y: number } }
+        | { type: "cancel" };
+      type?: "wrong-top-level-type";
+      paths?: string[];
+      position?: { x: number; y: number };
+    };
 
 let nativeDragDropHandler: ((event: MockWebviewDragDropEvent) => void) | null = null;
 const originalPointerEvent = window.PointerEvent;
@@ -942,14 +947,24 @@ describe("App", () => {
 
     await act(async () => {
       await emitNativeDropEvent({
-        type: "enter",
-        paths: ["C:/mock/imports/lead.wav", "C:/mock/imports/pad.mp3"],
-        position: { x: 420, y: 180 },
+        type: "wrong-top-level-type",
+        paths: [],
+        position: { x: 1, y: 1 },
+        payload: {
+          type: "over",
+          paths: ["C:/mock/imports/lead.wav", "C:/mock/imports/pad.mp3"],
+          position: { x: 420, y: 180 },
+        },
       });
       await emitNativeDropEvent({
-        type: "drop",
-        paths: ["C:/mock/imports/lead.wav", "C:/mock/imports/pad.mp3"],
-        position: { x: 420, y: 180 },
+        type: "wrong-top-level-type",
+        paths: [],
+        position: { x: 1, y: 1 },
+        payload: {
+          type: "drop",
+          paths: ["C:/mock/imports/lead.wav", "C:/mock/imports/pad.mp3"],
+          position: { x: 420, y: 180 },
+        },
       });
     });
 
@@ -997,9 +1012,11 @@ describe("App", () => {
     try {
       await act(async () => {
         await emitNativeDropEvent({
-          type: "enter",
-          paths: ["C:/mock/imports/lead.wav"],
-          position: { x: 840, y: 360 },
+          payload: {
+            type: "over",
+            paths: ["C:/mock/imports/lead.wav"],
+            position: { x: 840, y: 360 },
+          },
         });
       });
 
@@ -1007,9 +1024,11 @@ describe("App", () => {
 
       await act(async () => {
         await emitNativeDropEvent({
-          type: "drop",
-          paths: ["C:/mock/imports/lead.wav"],
-          position: { x: 840, y: 360 },
+          payload: {
+            type: "drop",
+            paths: ["C:/mock/imports/lead.wav"],
+            position: { x: 840, y: 360 },
+          },
         });
       });
 
@@ -1061,14 +1080,18 @@ describe("App", () => {
 
     await act(async () => {
       await emitNativeDropEvent({
-        type: "enter",
-        paths: ["C:/mock/imports/session.ltpkg", "C:/mock/imports/lead.wav"],
-        position: { x: 420, y: 180 },
+        payload: {
+          type: "over",
+          paths: ["C:/mock/imports/session.ltpkg", "C:/mock/imports/lead.wav"],
+          position: { x: 420, y: 180 },
+        },
       });
       await emitNativeDropEvent({
-        type: "drop",
-        paths: ["C:/mock/imports/session.ltpkg", "C:/mock/imports/lead.wav"],
-        position: { x: 420, y: 180 },
+        payload: {
+          type: "drop",
+          paths: ["C:/mock/imports/session.ltpkg", "C:/mock/imports/lead.wav"],
+          position: { x: 420, y: 180 },
+        },
       });
     });
 
@@ -1084,18 +1107,63 @@ describe("App", () => {
 
     await act(async () => {
       await emitNativeDropEvent({
-        type: "enter",
-        paths: ["C:/mock/imports/notes.txt"],
-        position: { x: 420, y: 180 },
+        payload: {
+          type: "over",
+          paths: ["C:/mock/imports/notes.txt"],
+          position: { x: 420, y: 180 },
+        },
       });
       await emitNativeDropEvent({
-        type: "drop",
-        paths: ["C:/mock/imports/notes.txt"],
-        position: { x: 420, y: 180 },
+        payload: {
+          type: "drop",
+          paths: ["C:/mock/imports/notes.txt"],
+          position: { x: 420, y: 180 },
+        },
       });
     });
 
     expect(await screen.findByText(textMatcher(en.transport.status.externalDropUnsupported))).toBeTruthy();
+  });
+
+  it("clears native external drop preview and does not import outside the timeline", async () => {
+    const desktopApi = await import("../features/transport/desktopApi");
+    const importAudioFilesFromPathsMock = vi.mocked(desktopApi.importAudioFilesFromPaths);
+    const importAudioFilesFromBytesMock = vi.mocked(desktopApi.importAudioFilesFromBytes);
+    const { container } = await renderApp();
+    mockRulerBounds(container);
+    mockLaneBounds(container);
+    mockTrackListBounds(container);
+    mockTimelinePaneBounds(container);
+
+    Object.defineProperty(document, "elementFromPoint", {
+      configurable: true,
+      value: vi.fn(() => document.body),
+    });
+
+    await act(async () => {
+      await emitNativeDropEvent({
+        payload: {
+          type: "over",
+          paths: ["C:/mock/imports/lead.wav"],
+          position: { x: 20, y: 20 },
+        },
+      });
+    });
+
+    expect(screen.queryByText("Audio")).toBeNull();
+
+    await act(async () => {
+      await emitNativeDropEvent({
+        payload: {
+          type: "drop",
+          paths: ["C:/mock/imports/lead.wav"],
+          position: { x: 20, y: 20 },
+        },
+      });
+    });
+
+    expect(importAudioFilesFromPathsMock).not.toHaveBeenCalled();
+    expect(importAudioFilesFromBytesMock).not.toHaveBeenCalled();
   });
 
   it("opens the global track-list context menu in an empty project and creates the first track", async () => {
