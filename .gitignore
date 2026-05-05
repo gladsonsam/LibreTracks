@@ -12,3 +12,4 @@ target-desktop-check/
 .DS_Store
 Thumbs.db
 repomix-output.xml
+graphify-out/

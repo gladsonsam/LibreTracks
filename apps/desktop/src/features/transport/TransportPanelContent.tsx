@@ -5417,10 +5417,10 @@ export function TransportPanelContent() {
     }
 
     const selectedCandidate =
-      candidates.find((candidate) => candidate.label === "raw/dpr" && candidate.isOverTimeline) ??
-      candidates.find((candidate) => candidate.label === "minus-webview/dpr" && candidate.isOverTimeline) ??
       candidates.find((candidate) => candidate.label === "raw" && candidate.isOverTimeline) ??
+      candidates.find((candidate) => candidate.label === "raw/dpr" && candidate.isOverTimeline) ??
       candidates.find((candidate) => candidate.label === "minus-webview" && candidate.isOverTimeline) ??
+      candidates.find((candidate) => candidate.label === "minus-webview/dpr" && candidate.isOverTimeline) ??
       null;
 
     nativeDropCoordinateModeRef.current = selectedCandidate?.label ?? null;
@@ -6182,26 +6182,18 @@ export function TransportPanelContent() {
     const kind = paths.length ? classifyDroppedPaths(paths).kind : "unknown";
     nativeDropKindRef.current = kind;
 
-    setExternalDropPreview((current) => {
-      if (current) {
-        return {
-          ...current,
-          kind,
-        };
-      }
+    const hit = resolveTimelineDropFromNativePosition(args.position);
+    if (NATIVE_DND_DEBUG_ENABLED) {
+      console.debug("[native-dnd] over hit", hit);
+    }
+    if (!hit.isOverTimeline) {
+      setExternalDropPreview(null);
+      return;
+    }
 
-      const hit = resolveTimelineDropFromNativePosition(args.position);
-      if (NATIVE_DND_DEBUG_ENABLED) {
-        console.debug("[native-dnd] over hit", hit);
-      }
-      if (!hit.isOverTimeline) {
-        return null;
-      }
-
-      return {
-        kind,
-        seconds: hit.dropSeconds,
-      };
+    setExternalDropPreview({
+      kind,
+      seconds: hit.dropSeconds,
     });
   }
 
