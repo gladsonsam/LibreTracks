@@ -1631,7 +1631,7 @@ impl StreamingClipReader {
 
         let elapsed_frames = timeline_frame.saturating_sub(plan.timeline_start_frame);
         let remaining_frames = plan.duration_frames.saturating_sub(elapsed_frames) as usize;
-        let declick_fade_frames = (0.005 * output_sample_rate as f32).round() as usize;
+        let declick_fade_frames = (0.015 * output_sample_rate as f32).round() as usize;
         let is_true_clip_start = elapsed_frames == 0 && plan.source_start_seconds <= f64::EPSILON;
         Ok(Self {
             shared_source,
@@ -2891,20 +2891,22 @@ mod tests {
             transpose_semitones: 0,
             ..exact_key.clone()
         };
-        cache.insert_ready_ram(
-            original_key,
-            Arc::new(RawRamSource::new(vec![0.1, 0.2, 0.3], 48_000, 1)),
-        )
-        .expect("prepared source should insert");
+        cache
+            .insert_ready_ram(
+                original_key,
+                Arc::new(RawRamSource::new(vec![0.1, 0.2, 0.3], 48_000, 1)),
+            )
+            .expect("prepared source should insert");
 
         let fallback = cache.get_best_available(&exact_key, 1);
         assert_eq!(fallback.kind(), SeekSourceKind::OriginalRam);
 
-        cache.insert_ready_ram(
-            exact_key.clone(),
-            Arc::new(TransposedRamSource::new(vec![0.4, 0.5, 0.6], 48_000, 1)),
-        )
-        .expect("prepared source should insert");
+        cache
+            .insert_ready_ram(
+                exact_key.clone(),
+                Arc::new(TransposedRamSource::new(vec![0.4, 0.5, 0.6], 48_000, 1)),
+            )
+            .expect("prepared source should insert");
         let exact = cache.get_best_available(&exact_key, 1);
 
         assert_eq!(exact.kind(), SeekSourceKind::ExactRam);
@@ -2943,11 +2945,12 @@ mod tests {
             transpose_semitones: 4,
             ..old_pitch_key.clone()
         };
-        cache.insert_ready_ram(
-            old_pitch_key,
-            Arc::new(TransposedRamSource::new(vec![0.1, 0.2], 48_000, 1)),
-        )
-        .expect("prepared source should insert");
+        cache
+            .insert_ready_ram(
+                old_pitch_key,
+                Arc::new(TransposedRamSource::new(vec![0.1, 0.2], 48_000, 1)),
+            )
+            .expect("prepared source should insert");
 
         let decision = cache.get_best_available(&requested_key, 0);
 
@@ -3062,7 +3065,9 @@ mod tests {
         let mut output = vec![0.0_f32; 16];
         let frames = decoded.read_interleaved_at(0, &mut output);
         assert_eq!(frames, 8);
-        assert!(output.chunks_exact(2).all(|frame| (frame[0] - frame[1]).abs() <= 1e-6));
+        assert!(output
+            .chunks_exact(2)
+            .all(|frame| (frame[0] - frame[1]).abs() <= 1e-6));
     }
 
     #[test]
@@ -3071,8 +3076,7 @@ mod tests {
         let song_dir = root.path().join("song");
         std::fs::create_dir_all(song_dir.join("audio")).expect("audio dir should exist");
         let audio_path = song_dir.join("audio/test.wav");
-        write_test_wav(&audio_path, &vec![0.25_f32; 48_000], 48_000, 2)
-            .expect("wav should write");
+        write_test_wav(&audio_path, &vec![0.25_f32; 48_000], 48_000, 2).expect("wav should write");
 
         let song = Song {
             id: "song".into(),
@@ -3143,8 +3147,8 @@ mod tests {
             let total_frames = sample_rate as usize;
             let mut samples = Vec::with_capacity(total_frames);
             for frame in 0..total_frames {
-                let radians = 2.0 * std::f32::consts::PI * 440.0 * frame as f32
-                    / sample_rate as f32;
+                let radians =
+                    2.0 * std::f32::consts::PI * 440.0 * frame as f32 / sample_rate as f32;
                 samples.push(radians.sin());
             }
 
@@ -3187,10 +3191,15 @@ mod tests {
             let mut bypass_mix = vec![0.0_f32; 2_048];
             let mut transposed_mix = vec![0.0_f32; 2_048];
 
-            bypass_reader
-                .mix_into_with_channel_gains(&mut bypass_mix, 0, 2_048, 1, 1.0, 0.0);
-            transposed_reader
-                .mix_into_with_channel_gains(&mut transposed_mix, 0, 2_048, 1, 1.0, 0.0);
+            bypass_reader.mix_into_with_channel_gains(&mut bypass_mix, 0, 2_048, 1, 1.0, 0.0);
+            transposed_reader.mix_into_with_channel_gains(
+                &mut transposed_mix,
+                0,
+                2_048,
+                1,
+                1.0,
+                0.0,
+            );
 
             assert_eq!(bypass_mix, transposed_mix);
         });

@@ -5,7 +5,9 @@ pub use model::{
     default_audio_to, parse_audio_output_route, Clip, Marker, Project, Song, SongRegion,
     TempoMarker, TempoMetadata, TempoSource, TimeSignatureMarker, Track, TrackKind,
 };
-pub use validation::{validate_song, DomainError, MAX_TRANSPOSE_SEMITONES, MIN_TRANSPOSE_SEMITONES};
+pub use validation::{
+    validate_song, DomainError, MAX_TRANSPOSE_SEMITONES, MIN_TRANSPOSE_SEMITONES,
+};
 
 #[cfg(test)]
 mod tests {

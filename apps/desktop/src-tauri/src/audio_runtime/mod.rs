@@ -29,11 +29,11 @@ use tauri::AppHandle;
 use crate::error::DesktopError;
 use crate::settings::AppSettings;
 
-#[cfg(test)]
-use self::backend::drain_consumer_samples;
 use self::backend::{
     build_output_stream, spawn_disk_reader, DiskReaderReport, DiskReaderState, OutputSample,
 };
+#[cfg(test)]
+use self::backend::{drain_consumer_samples, CpalCrossfadeState};
 #[cfg(test)]
 use self::mixer::{
     apply_runtime_pan, build_live_mix_map, build_playback_plans, interpolated_gain,
@@ -1285,8 +1285,8 @@ mod tests {
         prepare_audio_source, probe_audio_file, resolve_track_runtime_pan, scheduled_clip_count,
         set_zero_latency_test_mode, source, update_shared_track_mix, AudioBufferCache,
         AudioBufferCacheStats, AudioCommand, AudioCommandKind, AudioController, AudioDebugConfig,
-        AudioDebugSnapshot, AudioDebugState, AudioMeterLevel, DiskReaderState, MemoryClipReader,
-        Mixer, OutputSample, PlaybackBackend, PlaybackClipPlan, PlaybackSession,
+        AudioDebugSnapshot, AudioDebugState, AudioMeterLevel, CpalCrossfadeState, DiskReaderState,
+        MemoryClipReader, Mixer, OutputSample, PlaybackBackend, PlaybackClipPlan, PlaybackSession,
         PlaybackStartReason, ReaderCommand, RestartReport, SharedAudioSource, StopReport,
         SyncReport, DISK_RENDER_BLOCK_FRAMES, GAIN_EPSILON, STOP_FADE_DURATION_SECONDS,
     };
@@ -2609,7 +2609,7 @@ mod tests {
     }
 
     #[test]
-    fn musical_seek_smooths_boundary_instead_of_fading_from_zero() {
+    fn musical_seek_uses_equal_power_crossfade_instead_of_fading_from_zero() {
         let song = demo_song();
         let song_dir = PathBuf::from("song");
         let cache = AudioBufferCache::default();
@@ -2664,7 +2664,11 @@ mod tests {
 
         assert!(spliced_block[0] > 0.24);
         assert!(spliced_block[1] > 0.23);
-        assert!(spliced_block[63] < -0.07);
+        assert!(spliced_block[63] > 0.15);
+
+        let crossfade_tail = mixer.render_next_block(896);
+        let last_sample = crossfade_tail.last().copied().unwrap_or_default();
+        assert!((last_sample + 0.0875).abs() < 0.02);
     }
 
     #[test]
@@ -2750,12 +2754,16 @@ mod tests {
     }
 
     #[test]
-    fn mixer_swaps_prepared_fallback_to_exact_with_crossfade() {
+    fn mixer_uses_clean_reader_when_prepared_pitch_render_is_disabled() {
         let mut song = demo_song();
         song.regions[0].transpose_semitones = 2;
         let song_dir = PathBuf::from("song");
         let prepared_path = song_dir.join("audio/intro.wav");
         let cache = AudioBufferCache::default();
+        cache.insert_for_test(
+            prepared_path.clone(),
+            SharedAudioSource::from_preloaded(vec![0.25; 48_000 * 5], 48_000, 1, true),
+        );
         let exact_key = source::PreparedAudioKey {
             file_id: prepared_path.to_string_lossy().to_string(),
             file_hash: prepared_path.to_string_lossy().to_string(),
@@ -2788,10 +2796,9 @@ mod tests {
             cache.clone(),
         );
 
-        assert_eq!(
-            mixer.active_clips()[0].source_kind(),
-            Some(source::SeekSourceKind::OriginalRam)
-        );
+        assert_eq!(mixer.active_clips().len(), 1);
+        assert!(mixer.active_clips()[0].has_reader());
+        assert!(!mixer.active_clips()[0].has_prepared_source());
         cache.insert_prepared_ram_for_test(
             exact_key,
             Arc::new(source::TransposedRamSource::new(
@@ -2801,13 +2808,12 @@ mod tests {
             )),
         );
 
-        let block = mixer.render_next_block(1_024);
+        let mut block = mixer.render_next_block(1_024);
+        block.extend(mixer.render_next_block(1_024));
 
-        assert_eq!(
-            mixer.active_clips()[0].source_kind(),
-            Some(source::SeekSourceKind::ExactRam)
-        );
-        assert!(block.iter().any(|sample| *sample > 0.10));
+        assert!(block.iter().any(|sample| *sample > 0.02));
+        assert!(mixer.active_clips()[0].has_reader());
+        assert!(!mixer.active_clips()[0].has_prepared_source());
     }
 
     #[test]
@@ -2970,7 +2976,7 @@ mod tests {
     fn ring_consumer_writes_silence_when_buffer_runs_empty() {
         let (mut producer, mut consumer) = RingBuffer::<OutputSample>::new(4);
         let seek_generation = Arc::new(AtomicU64::new(0));
-        let mut active_generation = 0;
+        let mut state = CpalCrossfadeState::new(0, 48_000, 1);
         producer
             .push(OutputSample {
                 generation: 0,
@@ -2989,7 +2995,7 @@ mod tests {
             &mut output,
             &mut consumer,
             &seek_generation,
-            &mut active_generation,
+            &mut state,
             |sample| sample,
         );
 
@@ -3000,7 +3006,7 @@ mod tests {
     fn ring_consumer_flushes_stale_generation_on_seek() {
         let (mut producer, mut consumer) = RingBuffer::<OutputSample>::new(4);
         let seek_generation = Arc::new(AtomicU64::new(0));
-        let mut active_generation = 0;
+        let mut state = CpalCrossfadeState::new(0, 48_000, 1);
 
         producer
             .push(OutputSample {
@@ -3021,12 +3027,12 @@ mod tests {
             &mut output,
             &mut consumer,
             &seek_generation,
-            &mut active_generation,
+            &mut state,
             |sample| sample,
         );
 
-        assert_eq!(output, [0.0, 0.0]);
-        assert_eq!(active_generation, 1);
+        assert_eq!(output, [0.75, 0.0]);
+        assert_eq!(state.active_generation, 1);
     }
 
     #[test]
@@ -3191,7 +3197,12 @@ mod tests {
             transpose_semitones: 4,
         };
         assert!(cache.prepared_audio().get_original(&exact_key, 0).is_some());
-        assert!(cache.prepared_audio().get_exact(&exact_key, 0).is_some());
+        assert!(cache.prepared_audio().get_exact(&exact_key, 0).is_none());
+        let requests = cache.prepare_requests_for_test();
+        assert!(requests
+            .iter()
+            .any(|request| request.transpose_semitones == 4
+                && request.priority == source::PreparePriority::RealtimeCritical));
     }
 
     #[test]
@@ -3272,8 +3283,12 @@ mod tests {
         mixer.seek(song, 10.0);
         let spliced_block = mixer.render_next_block(64);
 
-        assert!(spliced_block[0].abs() > 0.08);
-        assert!(spliced_block.iter().any(|sample| *sample < -0.07));
+        assert!(spliced_block[0].abs() > 0.24);
+        assert!(spliced_block.iter().all(|sample| *sample > 0.15));
+
+        let crossfade_tail = mixer.render_next_block(896);
+        let last_sample = crossfade_tail.last().copied().unwrap_or_default();
+        assert!((last_sample + 0.0875).abs() < 0.02);
     }
 
     #[test]

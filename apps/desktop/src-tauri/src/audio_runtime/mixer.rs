@@ -6,7 +6,8 @@ const METRONOME_ACCENT_FREQUENCY_HZ: f32 = 1_000.0;
 const METRONOME_BEAT_FREQUENCY_HZ: f32 = 500.0;
 const METRONOME_BEEP_DURATION_SECONDS: f32 = 0.045;
 const METRONOME_PEAK_GAIN: f32 = 0.6;
-const PLAY_FROM_ZERO_FADE_MS: f32 = 2.0;
+const PLAY_FROM_ZERO_FADE_MS: f32 = 15.0;
+const SEEK_CROSSFADE_SECONDS: f32 = 0.020;
 
 #[cfg(test)]
 static ZERO_LATENCY_TEST_MODE: std::sync::atomic::AtomicBool =
@@ -52,9 +53,8 @@ pub(crate) struct Mixer {
     next_plan_index: usize,
     plans: Vec<PlaybackClipPlan>,
     active_clips: Vec<MixClipState>,
-    pending_seek_boundary_frames: Option<usize>,
-    seek_boundary_smoother: Option<SeekBoundarySmoother>,
-    last_output_frame: Option<Vec<f32>>,
+    crossfade_samples_remaining: usize,
+    crossfade_total_samples: usize,
     fade_from_zero: Option<FadeFromZeroSmoother>,
     mix_scratch: MixScratchBuffers,
     debug_config: telemetry::AudioDebugConfig,
@@ -95,20 +95,6 @@ pub(crate) enum TransportTransitionKind {
     MusicalJump,
     DragPreview,
     Stop,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum SeekSmoothingMode {
-    None,
-    BoundarySmooth32,
-    BoundarySmooth64,
-    FadeInFromZero,
-}
-
-struct SeekBoundarySmoother {
-    correction: Vec<f32>,
-    total_frames: usize,
-    remaining_frames: usize,
 }
 
 struct FadeFromZeroSmoother {
@@ -280,9 +266,8 @@ impl Mixer {
             next_plan_index: 0,
             plans,
             active_clips: Vec::new(),
-            pending_seek_boundary_frames: None,
-            seek_boundary_smoother: None,
-            last_output_frame: None,
+            crossfade_samples_remaining: 0,
+            crossfade_total_samples: 0,
             fade_from_zero: None,
             mix_scratch: MixScratchBuffers::default(),
             debug_config,
@@ -322,6 +307,15 @@ impl Mixer {
         position_seconds: f64,
         transition: TransportTransitionKind,
     ) {
+        let should_crossfade = transition_uses_true_crossfade(transition);
+        if should_crossfade {
+            self.crossfade_samples_remaining = seek_crossfade_samples(self.output_sample_rate);
+            self.crossfade_total_samples = self.crossfade_samples_remaining;
+        } else {
+            self.crossfade_samples_remaining = 0;
+            self.crossfade_total_samples = 0;
+        }
+
         let _ = replace_shared_live_mix(&self.live_mix_state, &song);
         self.song = song;
         self.cached_live_mix = LiveMixSnapshot::from_song(&self.song);
@@ -333,7 +327,7 @@ impl Mixer {
         self.next_plan_index = self
             .plans
             .partition_point(|plan| plan.timeline_end_frame() <= self.timeline_cursor_frame);
-        self.configure_seek_smoothing(transition);
+        self.fade_from_zero = fade_from_zero_for_transition(transition, self.output_sample_rate);
         self.active_clips.clear();
         self.opened_files = 0;
         self.activate_due_clips(
@@ -355,6 +349,11 @@ impl Mixer {
         {
             let live_mix_state = &self.cached_live_mix.tracks;
             let is_any_track_soloed = self.cached_live_mix.is_any_track_soloed;
+            let active_crossfade_gain =
+                (self.crossfade_samples_remaining > 0).then_some(CrossfadeGain::FadeIn {
+                    total_samples: self.crossfade_total_samples,
+                    samples_remaining: self.crossfade_samples_remaining,
+                });
 
             for clip_state in &mut self.active_clips {
                 let overlap_start = block_start.max(clip_state.plan.timeline_start_frame);
@@ -400,6 +399,7 @@ impl Mixer {
                     target_pan,
                     &output_routing,
                     &mut self.mix_scratch,
+                    active_crossfade_gain,
                 );
 
                 if let Some(index) = track_meters.as_ref().and_then(|_| {
@@ -459,9 +459,8 @@ impl Mixer {
         for (sample, direct_sample) in mixed.iter_mut().zip(direct_mixed) {
             *sample += direct_sample;
         }
-        self.apply_seek_boundary_smoothing(&mut mixed, block_frames);
         self.apply_fade_from_zero(&mut mixed, block_frames);
-        self.capture_last_output_frame(&mixed, block_frames);
+        self.advance_true_crossfade(block_frames);
         self.timeline_cursor_frame += block_frames as u64;
 
         mixed
@@ -877,77 +876,6 @@ impl Mixer {
         }
     }
 
-    fn configure_seek_smoothing(&mut self, transition: TransportTransitionKind) {
-        self.pending_seek_boundary_frames = None;
-        self.seek_boundary_smoother = None;
-        self.fade_from_zero = None;
-
-        match smoothing_mode_for_transition(transition) {
-            SeekSmoothingMode::None => {}
-            SeekSmoothingMode::BoundarySmooth32 => self.pending_seek_boundary_frames = Some(32),
-            SeekSmoothingMode::BoundarySmooth64 => self.pending_seek_boundary_frames = Some(64),
-            SeekSmoothingMode::FadeInFromZero => {
-                let fade_frames = ((PLAY_FROM_ZERO_FADE_MS / 1000.0)
-                    * self.output_sample_rate as f32)
-                    .round() as usize;
-                self.fade_from_zero = Some(FadeFromZeroSmoother::new(fade_frames.max(1)));
-            }
-        }
-    }
-
-    fn apply_seek_boundary_smoothing(&mut self, mixed: &mut [f32], block_frames: usize) {
-        if block_frames == 0 || mixed.is_empty() {
-            return;
-        }
-
-        let output_channels = self.output_channels.max(1);
-        if mixed.len() < output_channels {
-            return;
-        }
-        if let Some(frames) = self.pending_seek_boundary_frames.take() {
-            self.start_seek_boundary_smoothing(&mixed[..output_channels], frames);
-        }
-        let Some(smoother) = self.seek_boundary_smoother.as_mut() else {
-            return;
-        };
-        let frames_to_process = smoother.remaining_frames.min(block_frames);
-
-        for frame_idx in 0..frames_to_process {
-            let completed_frames = smoother
-                .total_frames
-                .saturating_sub(smoother.remaining_frames)
-                .saturating_add(frame_idx);
-            let denominator = smoother.total_frames.saturating_sub(1).max(1);
-            let progress = (completed_frames as f32 / denominator as f32).clamp(0.0, 1.0);
-            let correction_gain = 0.5 * (1.0 + (std::f32::consts::PI * progress).cos());
-            let base_idx = frame_idx * output_channels;
-
-            for ch in 0..output_channels {
-                mixed[base_idx + ch] += smoother.correction[ch] * correction_gain;
-            }
-        }
-
-        smoother.remaining_frames = smoother.remaining_frames.saturating_sub(frames_to_process);
-        if smoother.remaining_frames == 0 {
-            self.seek_boundary_smoother = None;
-        }
-    }
-
-    fn start_seek_boundary_smoothing(&mut self, first_new_frame: &[f32], frames: usize) {
-        let Some(last_frame) = self.last_output_frame.as_ref() else {
-            return;
-        };
-        let output_channels = self.output_channels.max(1);
-        if last_frame.len() < output_channels || first_new_frame.len() < output_channels {
-            return;
-        }
-        let mut correction = vec![0.0_f32; output_channels];
-        for ch in 0..output_channels {
-            correction[ch] = last_frame[ch] - first_new_frame[ch];
-        }
-        self.seek_boundary_smoother = Some(SeekBoundarySmoother::new(correction, frames));
-    }
-
     fn apply_fade_from_zero(&mut self, mixed: &mut [f32], block_frames: usize) {
         let Some(smoother) = self.fade_from_zero.as_mut() else {
             return;
@@ -977,26 +905,24 @@ impl Mixer {
         }
     }
 
-    fn capture_last_output_frame(&mut self, mixed: &[f32], block_frames: usize) {
-        let output_channels = self.output_channels.max(1);
-        if block_frames == 0 || mixed.len() < output_channels {
-            return;
+    fn advance_true_crossfade(&mut self, block_frames: usize) {
+        if self.crossfade_samples_remaining > 0 {
+            self.crossfade_samples_remaining = self
+                .crossfade_samples_remaining
+                .saturating_sub(block_frames);
         }
-        let start = mixed.len() - output_channels;
-        let frame = self.last_output_frame.get_or_insert_with(Vec::new);
-        frame.clear();
-        frame.extend_from_slice(&mixed[start..]);
+        if self.crossfade_samples_remaining == 0 {
+            self.crossfade_total_samples = 0;
+        }
     }
 }
 
-impl SeekBoundarySmoother {
-    fn new(correction: Vec<f32>, total_frames: usize) -> Self {
-        Self {
-            correction,
-            total_frames: total_frames.max(1),
-            remaining_frames: total_frames.max(1),
-        }
-    }
+#[derive(Debug, Clone, Copy)]
+enum CrossfadeGain {
+    FadeIn {
+        total_samples: usize,
+        samples_remaining: usize,
+    },
 }
 
 impl FadeFromZeroSmoother {
@@ -1008,19 +934,58 @@ impl FadeFromZeroSmoother {
     }
 }
 
-pub(crate) fn smoothing_mode_for_transition(
-    transition: TransportTransitionKind,
-) -> SeekSmoothingMode {
-    match transition {
-        TransportTransitionKind::InitialPlay | TransportTransitionKind::ResumePlay => {
-            SeekSmoothingMode::FadeInFromZero
-        }
-        TransportTransitionKind::ManualTimelineSeek => SeekSmoothingMode::BoundarySmooth64,
-        TransportTransitionKind::MusicalJump => SeekSmoothingMode::BoundarySmooth32,
-        TransportTransitionKind::DragPreview | TransportTransitionKind::Stop => {
-            SeekSmoothingMode::None
+impl CrossfadeGain {
+    fn gain_for_frame(self, frame_offset: usize) -> f32 {
+        match self {
+            Self::FadeIn {
+                total_samples,
+                samples_remaining,
+            } => equal_power_fade_in(total_samples, samples_remaining, frame_offset),
         }
     }
+}
+
+fn transition_uses_true_crossfade(transition: TransportTransitionKind) -> bool {
+    matches!(
+        transition,
+        TransportTransitionKind::ManualTimelineSeek | TransportTransitionKind::MusicalJump
+    )
+}
+
+fn fade_from_zero_for_transition(
+    transition: TransportTransitionKind,
+    output_sample_rate: u32,
+) -> Option<FadeFromZeroSmoother> {
+    if !matches!(
+        transition,
+        TransportTransitionKind::InitialPlay | TransportTransitionKind::ResumePlay
+    ) {
+        return None;
+    }
+
+    let fade_frames = ((PLAY_FROM_ZERO_FADE_MS / 1000.0) * output_sample_rate.max(1) as f32)
+        .round()
+        .max(1.0) as usize;
+    Some(FadeFromZeroSmoother::new(fade_frames))
+}
+
+fn seek_crossfade_samples(output_sample_rate: u32) -> usize {
+    (SEEK_CROSSFADE_SECONDS * output_sample_rate.max(1) as f32)
+        .round()
+        .max(1.0) as usize
+}
+
+fn crossfade_progress(total_samples: usize, samples_remaining: usize, frame_offset: usize) -> f32 {
+    let total_samples = total_samples.max(1);
+    let remaining_at_frame = samples_remaining.saturating_sub(frame_offset);
+    let completed = total_samples.saturating_sub(remaining_at_frame);
+    (completed as f32 / total_samples as f32).clamp(0.0, 1.0)
+}
+
+fn equal_power_fade_in(total_samples: usize, samples_remaining: usize, frame_offset: usize) -> f32 {
+    (crossfade_progress(total_samples, samples_remaining, frame_offset)
+        * std::f32::consts::FRAC_PI_2)
+        .sin()
 }
 
 impl From<PlaybackStartReason> for TransportTransitionKind {
@@ -1065,6 +1030,14 @@ impl MixClipState {
 
     pub(crate) fn source_kind(&self) -> Option<source::SeekSourceKind> {
         self.source_kind
+    }
+
+    pub(crate) fn has_reader(&self) -> bool {
+        self.reader.is_some()
+    }
+
+    pub(crate) fn has_prepared_source(&self) -> bool {
+        self.prepared_source.is_some()
     }
 }
 
@@ -1225,6 +1198,7 @@ impl MixClipState {
         target_pan: f32,
         output_routing: &[usize],
         scratch: &mut MixScratchBuffers,
+        crossfade_gain: Option<CrossfadeGain>,
     ) -> (f32, f32) {
         let start_gain = self.current_gain;
         let start_pan = self.current_pan;
@@ -1294,7 +1268,10 @@ impl MixClipState {
                 let clip_frame_position =
                     (overlap_start_frame - self.plan.timeline_start_frame) + frame_offset as u64;
                 let edge_gain = self.plan.edge_gain(clip_frame_position);
-                let final_gain = dynamic_gain * edge_gain;
+                let transition_gain = crossfade_gain
+                    .map(|gain| gain.gain_for_frame(offset_frames + frame_offset))
+                    .unwrap_or(1.0);
+                let final_gain = dynamic_gain * edge_gain * transition_gain;
                 let sample_base = frame_offset * source_channels;
                 let left_input = sanitize_mixed_sample(scratch.interleaved[sample_base]);
                 let right_input = if source_channels > 1 {
@@ -1334,9 +1311,12 @@ impl MixClipState {
             let clip_frame_position =
                 (overlap_start_frame - self.plan.timeline_start_frame) + frame_offset as u64;
             let edge_gain = self.plan.edge_gain(clip_frame_position);
+            let transition_gain = crossfade_gain
+                .map(|gain| gain.gain_for_frame(offset_frames + frame_offset))
+                .unwrap_or(1.0);
 
             let Some((left_sample, right_sample)) =
-                reader.next_stereo_frame(dynamic_gain * edge_gain, dynamic_pan)
+                reader.next_stereo_frame(dynamic_gain * edge_gain * transition_gain, dynamic_pan)
             else {
                 break;
             };

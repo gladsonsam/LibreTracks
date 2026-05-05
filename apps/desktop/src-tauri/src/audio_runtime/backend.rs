@@ -40,7 +40,11 @@ pub(crate) fn build_output_stream(
         SampleFormat::F32 => {
             let mut consumer = consumer;
             let seek_generation = seek_generation.clone();
-            let mut active_generation = seek_generation.load(Ordering::Acquire);
+            let mut state = CpalCrossfadeState::new(
+                seek_generation.load(Ordering::Acquire),
+                config.sample_rate.0,
+                config.channels as usize,
+            );
             device
                 .build_output_stream(
                     config,
@@ -49,7 +53,7 @@ pub(crate) fn build_output_stream(
                             data,
                             &mut consumer,
                             &seek_generation,
-                            &mut active_generation,
+                            &mut state,
                             |sample| sample,
                         )
                     },
@@ -61,7 +65,11 @@ pub(crate) fn build_output_stream(
         SampleFormat::I16 => {
             let mut consumer = consumer;
             let seek_generation = seek_generation.clone();
-            let mut active_generation = seek_generation.load(Ordering::Acquire);
+            let mut state = CpalCrossfadeState::new(
+                seek_generation.load(Ordering::Acquire),
+                config.sample_rate.0,
+                config.channels as usize,
+            );
             device
                 .build_output_stream(
                     config,
@@ -70,7 +78,7 @@ pub(crate) fn build_output_stream(
                             data,
                             &mut consumer,
                             &seek_generation,
-                            &mut active_generation,
+                            &mut state,
                             |sample| (sample.clamp(-1.0, 1.0) * i16::MAX as f32) as i16,
                         )
                     },
@@ -82,7 +90,11 @@ pub(crate) fn build_output_stream(
         SampleFormat::U16 => {
             let mut consumer = consumer;
             let seek_generation = seek_generation.clone();
-            let mut active_generation = seek_generation.load(Ordering::Acquire);
+            let mut state = CpalCrossfadeState::new(
+                seek_generation.load(Ordering::Acquire),
+                config.sample_rate.0,
+                config.channels as usize,
+            );
             device
                 .build_output_stream(
                     config,
@@ -91,7 +103,7 @@ pub(crate) fn build_output_stream(
                             data,
                             &mut consumer,
                             &seek_generation,
-                            &mut active_generation,
+                            &mut state,
                             |sample| {
                                 (((sample.clamp(-1.0, 1.0) * 0.5) + 0.5) * u16::MAX as f32) as u16
                             },
@@ -110,23 +122,86 @@ pub(crate) fn drain_consumer_samples<T>(
     data: &mut [T],
     consumer: &mut Consumer<OutputSample>,
     seek_generation: &Arc<AtomicU64>,
-    active_generation: &mut u64,
+    state: &mut CpalCrossfadeState,
     convert: impl Fn(f32) -> T,
 ) where
     T: Copy,
 {
     let latest_generation = seek_generation.load(Ordering::Acquire);
-    if latest_generation != *active_generation {
-        while consumer.pop().is_ok() {}
-        *active_generation = latest_generation;
+    if latest_generation != state.active_generation {
+        state.fading_buffer.clear();
+        state.fade_index = 0;
+
+        let mut new_overflow =
+            std::collections::VecDeque::with_capacity(state.overflow.len() + consumer.slots());
+        while let Some(sample) = state.overflow.pop_front() {
+            if sample.generation == state.active_generation {
+                state.fading_buffer.push(sample.value);
+            } else {
+                new_overflow.push_back(sample);
+            }
+        }
+
+        while let Ok(sample) = consumer.pop() {
+            if sample.generation == state.active_generation {
+                state.fading_buffer.push(sample.value);
+            } else {
+                new_overflow.push_back(sample);
+            }
+        }
+
+        let fade_len = state.fading_buffer.len().min(state.max_fade_samples);
+        state.fading_buffer.truncate(fade_len);
+
+        state.overflow = new_overflow;
+        state.active_generation = latest_generation;
     }
 
     for output in data {
-        let sample = match consumer.pop() {
-            Ok(sample) if sample.generation == *active_generation => sample.value,
-            Ok(_) | Err(_) => 0.0,
+        let sample = if let Some(sample) = state.overflow.pop_front() {
+            sample.value
+        } else {
+            match consumer.pop() {
+                Ok(sample) if sample.generation == state.active_generation => sample.value,
+                Ok(sample) => {
+                    state.overflow.push_back(sample);
+                    0.0
+                }
+                Err(_) => 0.0,
+            }
         };
-        *output = convert(sample);
+
+        let mut final_sample = sample;
+
+        if state.fade_index < state.fading_buffer.len() {
+            let old_sample = state.fading_buffer[state.fade_index];
+            let fade_progress = state.fade_index as f32 / state.fading_buffer.len().max(1) as f32;
+            let fade_out = (fade_progress * std::f32::consts::FRAC_PI_2).cos();
+            final_sample += old_sample * fade_out;
+            state.fade_index += 1;
+        }
+
+        *output = convert(final_sample);
+    }
+}
+
+pub(crate) struct CpalCrossfadeState {
+    pub active_generation: u64,
+    pub fading_buffer: Vec<f32>,
+    pub fade_index: usize,
+    pub overflow: std::collections::VecDeque<OutputSample>,
+    pub max_fade_samples: usize,
+}
+
+impl CpalCrossfadeState {
+    pub fn new(active_generation: u64, sample_rate: u32, channels: usize) -> Self {
+        Self {
+            active_generation,
+            fading_buffer: Vec::with_capacity(8192),
+            fade_index: 0,
+            overflow: std::collections::VecDeque::with_capacity(8192),
+            max_fade_samples: (0.020 * sample_rate as f32).round() as usize * channels,
+        }
     }
 }
 
