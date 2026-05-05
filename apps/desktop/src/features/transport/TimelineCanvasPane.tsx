@@ -13,10 +13,7 @@ import type {
 } from "./desktopApi";
 import type { TimelineClipSummary, TimelineTrackSummary } from "./pendingAudioImports";
 import {
-  buildSongTempoRegions,
   formatTransposeSemitones,
-  getSongBaseBpm,
-  getSongBaseTimeSignature,
 } from "./desktopApi";
 import { PlayheadOverlay } from "./PlayheadOverlay";
 import {
@@ -26,7 +23,6 @@ import {
 } from "./Renderer/drawBackground";
 import {
   BASE_PIXELS_PER_SECOND,
-  clientXToTimelineSeconds,
   snapToTimelineGrid,
   type TimelineGrid,
 } from "./timelineMath";
@@ -122,6 +118,11 @@ type TimelineCanvasPaneProps = {
     track: TimelineTrackSummary,
     trackClips: ClipSummary[],
   ) => void;
+  onResolveTimelineDropFromClientPoint: (clientX: number, clientY: number) => {
+    isOverTimeline: boolean;
+    dropSeconds: number;
+    targetTrackId: string | null;
+  };
   onExternalDropPreviewChange: (preview: ExternalDropPreview | null) => void;
   onExternalDrop: (classification: DroppedFileClassification, seconds: number) => void;
 };
@@ -179,6 +180,7 @@ export function TimelineCanvasPane({
   onTrackListContextMenu,
   onTrackLaneMouseDown,
   onTrackLaneContextMenu,
+  onResolveTimelineDropFromClientPoint,
   onExternalDropPreviewChange,
   onExternalDrop,
 }: TimelineCanvasPaneProps) {
@@ -189,34 +191,24 @@ export function TimelineCanvasPane({
     event.dataTransfer.dropEffect = "copy";
   };
 
-  const resolveExternalDropSeconds = (clientX: number, element: HTMLElement) => {
-    const rawSeconds = clientXToTimelineSeconds(clientX, element, scrollViewportRef.current, pixelsPerSecond);
-    if (!song) {
-      return rawSeconds;
-    }
-
-    return snapToTimelineGrid(
-      rawSeconds,
-      getSongBaseBpm(song),
-      getSongBaseTimeSignature(song),
-      pixelsPerSecond / BASE_PIXELS_PER_SECOND,
-      pixelsPerSecond,
-      buildSongTempoRegions(song),
-    );
-  };
-
   const handleExternalDragOver = (event: ReactDragEvent<HTMLDivElement>) => {
     if (!isExternalFileDrag(event.dataTransfer)) {
       return;
     }
 
     const classification = classifyDroppedFiles(getDroppedFiles(event.dataTransfer));
+    const hit = onResolveTimelineDropFromClientPoint(event.clientX, event.clientY);
+    if (!hit.isOverTimeline) {
+      onExternalDropPreviewChange(null);
+      return;
+    }
+
     event.preventDefault();
     event.stopPropagation();
     event.dataTransfer.dropEffect = "copy";
     onExternalDropPreviewChange({
       kind: classification.kind,
-      seconds: resolveExternalDropSeconds(event.clientX, event.currentTarget),
+      seconds: hit.dropSeconds,
     });
   };
 
@@ -239,10 +231,16 @@ export function TimelineCanvasPane({
     }
 
     const classification = classifyDroppedFiles(getDroppedFiles(event.dataTransfer));
+    const hit = onResolveTimelineDropFromClientPoint(event.clientX, event.clientY);
+    if (!hit.isOverTimeline) {
+      onExternalDropPreviewChange(null);
+      return;
+    }
+
     event.preventDefault();
     event.stopPropagation();
     onExternalDropPreviewChange(null);
-    onExternalDrop(classification, resolveExternalDropSeconds(event.clientX, event.currentTarget));
+    onExternalDrop(classification, hit.dropSeconds);
   };
 
   return (

@@ -169,6 +169,27 @@ export function toPendingLibraryAsset(importJob: PendingAudioImport): PendingLib
   };
 }
 
+export function mergeLibraryAssetsByFilePath(
+  baseAssets: LibraryAssetSummary[],
+  incomingAssets: LibraryAssetSummary[],
+): LibraryAssetSummary[] {
+  const byFilePath = new Map<string, LibraryAssetSummary>();
+
+  for (const asset of baseAssets) {
+    byFilePath.set(asset.filePath, asset);
+  }
+
+  for (const asset of incomingAssets) {
+    byFilePath.set(asset.filePath, asset);
+  }
+
+  return [...byFilePath.values()].sort((left, right) => {
+    const leftFolder = (left.folderPath ?? "").toLowerCase();
+    const rightFolder = (right.folderPath ?? "").toLowerCase();
+    return leftFolder.localeCompare(rightFolder) || left.fileName.localeCompare(right.fileName);
+  });
+}
+
 export function getPendingClipLabel(status: PendingAudioImportStatus): string {
   switch (status) {
     case "queued":

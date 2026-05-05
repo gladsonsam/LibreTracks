@@ -144,6 +144,7 @@ import {
 import {
   createPendingAudioImports,
   createPendingAudioImportsFromPaths,
+  mergeLibraryAssetsByFilePath,
   mergePendingClipsByTrack,
   nextPaint,
   toPendingLibraryAsset,
@@ -1298,15 +1299,20 @@ export function TransportPanelContent() {
     return { assets, folders };
   }, [playbackSongDir]);
 
-  const refreshLibraryState = useCallback(async () => {
+  const refreshLibraryState = useCallback(async (options?: { preserveAssets?: LibraryAssetSummary[] }) => {
     const requestId = ++libraryStateRequestIdRef.current;
     const { assets, folders } = await loadLibraryState();
     if (requestId !== libraryStateRequestIdRef.current) {
-      return;
+      return assets;
     }
 
-    setLibraryAssets(assets);
+    const nextAssets = options?.preserveAssets?.length
+      ? mergeLibraryAssetsByFilePath(assets, options.preserveAssets)
+      : assets;
+
+    setLibraryAssets(nextAssets);
     setLibraryFolders(folders);
+    return nextAssets;
   }, [loadLibraryState]);
 
   const mergeLibraryAssets = useCallback((importedAssets: LibraryAssetSummary[]) => {
@@ -1317,16 +1323,7 @@ export function TransportPanelContent() {
     libraryStateRequestIdRef.current += 1;
 
     setLibraryAssets((current) => {
-      const byFilePath = new Map(current.map((asset) => [asset.filePath, asset]));
-      for (const asset of importedAssets) {
-        byFilePath.set(asset.filePath, asset);
-      }
-
-      return [...byFilePath.values()].sort((left, right) => {
-        const leftFolder = (left.folderPath ?? "").toLowerCase();
-        const rightFolder = (right.folderPath ?? "").toLowerCase();
-        return leftFolder.localeCompare(rightFolder) || left.fileName.localeCompare(right.fileName);
-      });
+      return mergeLibraryAssetsByFilePath(current, importedAssets);
     });
   }, []);
 
@@ -5825,7 +5822,7 @@ export function TransportPanelContent() {
 
       useTransportStore.getState().updatePendingAudioImportStatus(pendingIds, "metadata");
       mergeLibraryAssets(importedAssets);
-      await refreshLibraryState();
+      await refreshLibraryState({ preserveAssets: importedAssets });
 
       useTransportStore.getState().updatePendingAudioImportStatus(pendingIds, "analyzing");
       await createRealTracksAndClipsForImportedAssets({
@@ -5888,7 +5885,7 @@ export function TransportPanelContent() {
 
       useTransportStore.getState().updatePendingAudioImportStatus(pendingIds, "metadata");
       mergeLibraryAssets(importedAssets);
-      await refreshLibraryState();
+      await refreshLibraryState({ preserveAssets: importedAssets });
 
       useTransportStore.getState().updatePendingAudioImportStatus(pendingIds, "analyzing");
       await createRealTracksAndClipsForImportedAssets({
@@ -6659,6 +6656,7 @@ export function TransportPanelContent() {
                 onTrackListContextMenu={handleTrackListContextMenu}
                 onTrackLaneMouseDown={handleTrackLaneMouseDown}
                 onTrackLaneContextMenu={handleTrackLaneContextMenu}
+                onResolveTimelineDropFromClientPoint={resolveTimelineDropFromClientPoint}
                 onExternalDropPreviewChange={setExternalDropPreview}
                 onExternalDrop={handleExternalTimelineDrop}
               />
