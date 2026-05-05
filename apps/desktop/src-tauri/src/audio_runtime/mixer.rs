@@ -6,7 +6,11 @@ const METRONOME_ACCENT_FREQUENCY_HZ: f32 = 1_000.0;
 const METRONOME_BEAT_FREQUENCY_HZ: f32 = 500.0;
 const METRONOME_BEEP_DURATION_SECONDS: f32 = 0.045;
 const METRONOME_PEAK_GAIN: f32 = 0.6;
-const DECLICK_FADE_MS: f32 = 5.0;
+const SEEK_DECLICK_FADE_MS: f32 = 2.0;
+
+#[cfg(test)]
+static ZERO_LATENCY_TEST_MODE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 
 #[derive(Debug, Clone)]
 pub(crate) struct LiveTrackMix {
@@ -49,7 +53,6 @@ pub(crate) struct Mixer {
     plans: Vec<PlaybackClipPlan>,
     active_clips: Vec<MixClipState>,
     needs_declick: bool,
-    last_output_frame: Vec<f32>,
     debug_config: telemetry::AudioDebugConfig,
     opened_files: usize,
     track_meter_indices: HashMap<String, usize>,
@@ -62,9 +65,22 @@ pub(crate) struct Mixer {
 
 pub(crate) struct MixClipState {
     plan: PlaybackClipPlan,
-    reader: source::MemoryClipReader,
+    reader: Option<source::MemoryClipReader>,
+    prepared_source: Option<Arc<dyn source::PreparedAudioSource>>,
+    source_kind: Option<source::SeekSourceKind>,
+    source_key: Option<source::PreparedAudioKey>,
+    pending_swap: Option<PendingSourceSwap>,
     current_gain: f32,
     current_pan: f32,
+}
+
+pub(crate) struct PendingSourceSwap {
+    old_source: Arc<dyn source::PreparedAudioSource>,
+    new_source: Arc<dyn source::PreparedAudioSource>,
+    old_kind: source::SeekSourceKind,
+    new_kind: source::SeekSourceKind,
+    crossfade_total_frames: usize,
+    crossfade_remaining_frames: usize,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -122,6 +138,18 @@ impl PlaybackClipPlan {
     pub(crate) fn timeline_end_frame(&self) -> u64 {
         self.timeline_start_frame
             .saturating_add(self.duration_frames)
+    }
+
+    pub(crate) fn source_frame_at_timeline_frame(
+        &self,
+        timeline_frame: u64,
+        output_sample_rate: u32,
+        source_sample_rate: u32,
+    ) -> u64 {
+        let elapsed_frames = timeline_frame.saturating_sub(self.timeline_start_frame);
+        let elapsed_seconds = elapsed_frames as f64 / output_sample_rate.max(1) as f64;
+        let source_seconds = self.source_start_seconds.max(0.0) + elapsed_seconds;
+        seconds_to_frames(source_seconds, source_sample_rate)
     }
 
     pub(crate) fn edge_gain(&self, clip_frame_position: u64) -> f32 {
@@ -213,7 +241,6 @@ impl Mixer {
             plans,
             active_clips: Vec::new(),
             needs_declick: false,
-            last_output_frame: vec![0.0; output_channels.max(1)],
             debug_config,
             opened_files: 0,
             track_meter_indices,
@@ -278,6 +305,11 @@ impl Mixer {
                 if overlap_end <= overlap_start {
                     continue;
                 }
+                clip_state.prepare_exact_swap(
+                    &self.audio_buffers.prepared_audio(),
+                    overlap_start,
+                    self.output_sample_rate,
+                );
 
                 let offset_frames = (overlap_start - block_start) as usize;
                 let overlap_frames = (overlap_end - overlap_start) as usize;
@@ -306,6 +338,7 @@ impl Mixer {
                     overlap_frames,
                     self.output_channels,
                     overlap_start,
+                    self.output_sample_rate,
                     target_gain,
                     target_pan,
                     &output_routing,
@@ -345,7 +378,8 @@ impl Mixer {
         }
 
         self.active_clips.retain(|clip_state| {
-            !clip_state.reader.eof && block_end < clip_state.plan.timeline_end_frame()
+            !clip_state.reader.as_ref().is_some_and(|reader| reader.eof)
+                && block_end < clip_state.plan.timeline_end_frame()
         });
         if is_master_route(&metronome_settings.audio_to) {
             self.mix_metronome_into_output(
@@ -367,8 +401,7 @@ impl Mixer {
         for (sample, direct_sample) in mixed.iter_mut().zip(direct_mixed) {
             *sample += direct_sample;
         }
-        self.apply_declick_crossfade(&mut mixed, block_frames);
-        self.capture_last_output_frame(&mixed, block_frames);
+        self.apply_seek_declick_fade_in(&mut mixed, block_frames);
         self.timeline_cursor_frame += block_frames as u64;
 
         mixed
@@ -376,7 +409,8 @@ impl Mixer {
 
     fn prune_inactive_clips(&mut self, timeline_frame: u64) {
         self.active_clips.retain(|clip_state| {
-            !clip_state.reader.eof && timeline_frame < clip_state.plan.timeline_end_frame()
+            !clip_state.reader.as_ref().is_some_and(|reader| reader.eof)
+                && timeline_frame < clip_state.plan.timeline_end_frame()
         });
     }
 
@@ -394,13 +428,72 @@ impl Mixer {
                 continue;
             }
 
+            let prepared_key = self.prepared_key_for_plan(&plan);
+            let source_frame = plan.source_frame_at_timeline_frame(
+                activation_start_frame,
+                self.output_sample_rate,
+                self.output_sample_rate,
+            );
+            if let Some((prepared_source, source_kind)) =
+                self.prepared_source_for_plan(&prepared_key, source_frame, false)
+            {
+                let current_gain = resolve_clip_runtime_gain(
+                    &self.cached_live_mix.tracks,
+                    &plan.track_id,
+                    plan.clip_gain,
+                    self.cached_live_mix.is_any_track_soloed,
+                );
+                let current_pan =
+                    resolve_track_runtime_pan(&self.cached_live_mix.tracks, &plan.track_id);
+                self.active_clips.push(MixClipState {
+                    plan,
+                    reader: None,
+                    prepared_source: Some(prepared_source),
+                    source_kind: Some(source_kind),
+                    source_key: Some(prepared_key),
+                    pending_swap: None,
+                    current_gain,
+                    current_pan,
+                });
+                continue;
+            }
+
+            if zero_latency_mode_enabled() {
+                let current_gain = resolve_clip_runtime_gain(
+                    &self.cached_live_mix.tracks,
+                    &plan.track_id,
+                    plan.clip_gain,
+                    self.cached_live_mix.is_any_track_soloed,
+                );
+                let current_pan =
+                    resolve_track_runtime_pan(&self.cached_live_mix.tracks, &plan.track_id);
+                self.active_clips.push(MixClipState {
+                    plan,
+                    reader: None,
+                    prepared_source: Some(self.silent_prepared_source()),
+                    source_kind: Some(source::SeekSourceKind::Silence),
+                    source_key: Some(prepared_key),
+                    pending_swap: None,
+                    current_gain,
+                    current_pan,
+                });
+                continue;
+            }
+
+            debug_assert!(
+                !zero_latency_mode_enabled(),
+                "StreamingClipReader cannot be used in zero-latency playback mode"
+            );
             match source::StreamingClipReader::open(
                 &plan,
                 self.output_sample_rate,
                 &self.audio_buffers,
                 activation_start_frame,
             ) {
-                Ok(reader) => {
+                Ok(mut reader) => {
+                    if self.needs_declick {
+                        reader.suppress_initial_declick();
+                    }
                     let current_gain = resolve_clip_runtime_gain(
                         &self.cached_live_mix.tracks,
                         &plan.track_id,
@@ -411,7 +504,11 @@ impl Mixer {
                         resolve_track_runtime_pan(&self.cached_live_mix.tracks, &plan.track_id);
                     self.active_clips.push(MixClipState {
                         plan,
-                        reader,
+                        reader: Some(reader),
+                        prepared_source: None,
+                        source_kind: None,
+                        source_key: None,
+                        pending_swap: None,
                         current_gain,
                         current_pan,
                     });
@@ -431,6 +528,11 @@ impl Mixer {
         let plans = self.plans.clone();
         let live_mix_state = &self.cached_live_mix.tracks;
         let is_any_track_soloed = self.cached_live_mix.is_any_track_soloed;
+        let output_sample_rate = self.output_sample_rate;
+        let output_channels = self.output_channels.max(1);
+        let audio_buffers = self.audio_buffers.clone();
+        let prepared_cache = self.audio_buffers.prepared_audio();
+        let silent_source = self.silent_prepared_source();
         let mut refreshed_clips = Vec::with_capacity(self.active_clips.len());
 
         for mut clip_state in self.active_clips.drain(..) {
@@ -448,13 +550,42 @@ impl Mixer {
             clip_state.plan = next_plan.clone();
 
             if plan_changed {
-                if let Ok(reader) = source::StreamingClipReader::open(
+                let prepared_key = source::PreparedAudioKey {
+                    file_id: next_plan.file_path.to_string_lossy().to_string(),
+                    file_hash: next_plan.file_path.to_string_lossy().to_string(),
+                    sample_rate: output_sample_rate,
+                    channels: output_channels,
+                    transpose_semitones: next_plan.transpose_semitones,
+                };
+                let source_frame = next_plan.source_frame_at_timeline_frame(
+                    current_frame,
+                    output_sample_rate,
+                    output_sample_rate,
+                );
+                let decision = prepared_cache.get_best_available(&prepared_key, source_frame);
+                if !matches!(decision, source::SeekSourceDecision::Silence) {
+                    clip_state.reader = None;
+                    clip_state.prepared_source = Some(prepared_cache.source_or_silence(&decision));
+                    clip_state.source_kind = Some(decision.kind());
+                    clip_state.source_key = Some(prepared_key);
+                    clip_state.pending_swap = None;
+                } else if zero_latency_mode_enabled() {
+                    clip_state.reader = None;
+                    clip_state.prepared_source = Some(silent_source.clone());
+                    clip_state.source_kind = Some(source::SeekSourceKind::Silence);
+                    clip_state.source_key = Some(prepared_key);
+                    clip_state.pending_swap = None;
+                } else if let Ok(reader) = source::StreamingClipReader::open(
                     &next_plan,
-                    self.output_sample_rate,
-                    &self.audio_buffers,
+                    output_sample_rate,
+                    &audio_buffers,
                     current_frame,
                 ) {
-                    clip_state.reader = reader;
+                    clip_state.reader = Some(reader);
+                    clip_state.prepared_source = None;
+                    clip_state.source_kind = None;
+                    clip_state.source_key = None;
+                    clip_state.pending_swap = None;
                 }
                 clip_state.current_gain = resolve_clip_runtime_gain(
                     live_mix_state,
@@ -505,6 +636,36 @@ impl Mixer {
             };
             self.track_child_indices[parent_index].push(child_index);
         }
+    }
+
+    fn prepared_key_for_plan(&self, plan: &PlaybackClipPlan) -> source::PreparedAudioKey {
+        source::PreparedAudioKey {
+            file_id: plan.file_path.to_string_lossy().to_string(),
+            file_hash: plan.file_path.to_string_lossy().to_string(),
+            sample_rate: self.output_sample_rate,
+            channels: self.output_channels.max(1),
+            transpose_semitones: plan.transpose_semitones,
+        }
+    }
+
+    fn prepared_source_for_plan(
+        &self,
+        key: &source::PreparedAudioKey,
+        source_frame: u64,
+        allow_silence: bool,
+    ) -> Option<(Arc<dyn source::PreparedAudioSource>, source::SeekSourceKind)> {
+        let prepared_cache = self.audio_buffers.prepared_audio();
+        let decision = prepared_cache.get_best_available(key, source_frame);
+        if matches!(decision, source::SeekSourceDecision::Silence) && !allow_silence {
+            return None;
+        }
+        Some((prepared_cache.source_or_silence(&decision), decision.kind()))
+    }
+
+    fn silent_prepared_source(&self) -> Arc<dyn source::PreparedAudioSource> {
+        self.audio_buffers
+            .prepared_audio()
+            .source_or_silence(&source::SeekSourceDecision::Silence)
     }
 
     fn empty_track_meters(&self) -> Vec<AudioMeterLevel> {
@@ -682,41 +843,28 @@ impl Mixer {
         }
     }
 
-    fn apply_declick_crossfade(&mut self, mixed: &mut [f32], block_frames: usize) {
+    fn apply_seek_declick_fade_in(&mut self, mixed: &mut [f32], block_frames: usize) {
         if !self.needs_declick || block_frames == 0 {
             return;
         }
 
         let fade_frames =
-            ((DECLICK_FADE_MS / 1000.0) * self.output_sample_rate as f32).round() as usize;
+            ((SEEK_DECLICK_FADE_MS / 1000.0) * self.output_sample_rate as f32).round() as usize;
         let fade_frames = fade_frames.max(1);
         let frames_to_process = fade_frames.min(block_frames);
         let output_channels = self.output_channels.max(1);
 
         for frame_idx in 0..frames_to_process {
-            let fade_in = frame_idx as f32 / fade_frames as f32;
-            let fade_out = 1.0 - fade_in;
+            let x = frame_idx as f32 / fade_frames as f32;
+            let fade_in = x * x * (3.0 - (2.0 * x));
             let base_idx = frame_idx * output_channels;
 
             for ch in 0..output_channels {
-                let old_sample = self.last_output_frame[ch];
-                let new_sample = mixed[base_idx + ch];
-                mixed[base_idx + ch] = (old_sample * fade_out) + (new_sample * fade_in);
+                mixed[base_idx + ch] *= fade_in;
             }
         }
 
         self.needs_declick = false;
-    }
-
-    fn capture_last_output_frame(&mut self, mixed: &[f32], block_frames: usize) {
-        if block_frames == 0 {
-            return;
-        }
-
-        let output_channels = self.output_channels.max(1);
-        let last_frame_base = (block_frames - 1) * output_channels;
-        self.last_output_frame
-            .copy_from_slice(&mixed[last_frame_base..last_frame_base + output_channels]);
     }
 }
 
@@ -738,7 +886,14 @@ impl MixClipState {
     }
 
     pub(crate) fn reader_current_frame(&self) -> usize {
-        self.reader.current_frame()
+        self.reader
+            .as_ref()
+            .map(source::MemoryClipReader::current_frame)
+            .unwrap_or_default()
+    }
+
+    pub(crate) fn source_kind(&self) -> Option<source::SeekSourceKind> {
+        self.source_kind
     }
 }
 
@@ -821,6 +976,54 @@ impl MeterEmitterState {
 }
 
 impl MixClipState {
+    fn prepare_exact_swap(
+        &mut self,
+        cache: &source::PreparedAudioCache,
+        timeline_frame: u64,
+        output_sample_rate: u32,
+    ) {
+        if self.pending_swap.is_some() {
+            return;
+        }
+        let Some(current_source) = self.prepared_source.as_ref().cloned() else {
+            return;
+        };
+        let Some(current_kind) = self.source_kind else {
+            return;
+        };
+        if matches!(
+            current_kind,
+            source::SeekSourceKind::ExactRam | source::SeekSourceKind::ExactDisk
+        ) {
+            return;
+        }
+        let Some(key) = self.source_key.as_ref() else {
+            return;
+        };
+        let source_frame = self.plan.source_frame_at_timeline_frame(
+            timeline_frame,
+            output_sample_rate,
+            current_source.sample_rate(),
+        );
+        let Some(exact_source) = cache.get_exact(key, source_frame) else {
+            return;
+        };
+        let new_kind = match cache.get_best_available(key, source_frame).kind() {
+            source::SeekSourceKind::ExactDisk => source::SeekSourceKind::ExactDisk,
+            _ => source::SeekSourceKind::ExactRam,
+        };
+        let crossfade_total_frames =
+            ((0.010 * output_sample_rate.max(1) as f32).round() as usize).max(1);
+        self.pending_swap = Some(PendingSourceSwap {
+            old_source: current_source,
+            new_source: exact_source,
+            old_kind: current_kind,
+            new_kind,
+            crossfade_total_frames,
+            crossfade_remaining_frames: crossfade_total_frames,
+        });
+    }
+
     fn mix_into(
         &mut self,
         buffer: &mut [f32],
@@ -828,6 +1031,7 @@ impl MixClipState {
         frame_count: usize,
         output_channels: usize,
         overlap_start_frame: u64,
+        output_sample_rate: u32,
         target_gain: f32,
         target_pan: f32,
         output_routing: &[usize],
@@ -837,6 +1041,98 @@ impl MixClipState {
         let mut left_peak = 0.0_f32;
         let mut right_peak = 0.0_f32;
 
+        if let Some(source) = self.prepared_source.as_ref() {
+            let source_channels = source.channels().max(1);
+            let source_start_frame = self.plan.source_frame_at_timeline_frame(
+                overlap_start_frame,
+                output_sample_rate,
+                source.sample_rate(),
+            );
+            let mut interleaved = vec![0.0_f32; frame_count * source_channels];
+            let mut completed_swap: Option<(
+                Arc<dyn source::PreparedAudioSource>,
+                source::SeekSourceKind,
+            )> = None;
+            let frames_read = if let Some(swap) = self.pending_swap.as_mut() {
+                let _old_kind = swap.old_kind;
+                let mut old_interleaved = vec![0.0_f32; frame_count * source_channels];
+                let mut new_interleaved = vec![0.0_f32; frame_count * source_channels];
+                let old_frames = swap
+                    .old_source
+                    .read_interleaved_at(source_start_frame, &mut old_interleaved);
+                let new_frames = swap
+                    .new_source
+                    .read_interleaved_at(source_start_frame, &mut new_interleaved);
+                let frames = old_frames.max(new_frames);
+                for frame in 0..frames {
+                    let remaining = swap.crossfade_remaining_frames.saturating_sub(frame);
+                    let progress = 1.0
+                        - (remaining as f32 / swap.crossfade_total_frames.max(1) as f32)
+                            .clamp(0.0, 1.0);
+                    let fade_in = (progress * std::f32::consts::FRAC_PI_2).sin();
+                    let fade_out = ((1.0 - progress) * std::f32::consts::FRAC_PI_2).sin();
+                    for channel in 0..source_channels {
+                        let index = frame * source_channels + channel;
+                        interleaved[index] = (old_interleaved[index] * fade_out)
+                            + (new_interleaved[index] * fade_in);
+                    }
+                }
+                swap.crossfade_remaining_frames =
+                    swap.crossfade_remaining_frames.saturating_sub(frames);
+                if swap.crossfade_remaining_frames == 0 {
+                    completed_swap = Some((swap.new_source.clone(), swap.new_kind));
+                }
+                frames
+            } else {
+                source.read_interleaved_at(source_start_frame, &mut interleaved)
+            };
+            if let Some((new_source, new_kind)) = completed_swap {
+                self.prepared_source = Some(new_source);
+                self.source_kind = Some(new_kind);
+                self.pending_swap = None;
+            }
+
+            for frame_offset in 0..frames_read {
+                let dynamic_gain =
+                    interpolated_gain(start_gain, target_gain, frame_offset, frame_count);
+                let dynamic_pan =
+                    interpolated_gain(start_pan, target_pan, frame_offset, frame_count);
+                let clip_frame_position =
+                    (overlap_start_frame - self.plan.timeline_start_frame) + frame_offset as u64;
+                let edge_gain = self.plan.edge_gain(clip_frame_position);
+                let final_gain = dynamic_gain * edge_gain;
+                let sample_base = frame_offset * source_channels;
+                let left_input = interleaved[sample_base];
+                let right_input = if source_channels > 1 {
+                    interleaved[sample_base + 1]
+                } else {
+                    left_input
+                };
+                let (left_sample, right_sample) =
+                    apply_runtime_pan(left_input, right_input, dynamic_pan, source_channels);
+                let left_sample = left_sample * final_gain;
+                let right_sample = right_sample * final_gain;
+                write_frame_to_output(
+                    buffer,
+                    offset_frames + frame_offset,
+                    output_channels,
+                    output_routing,
+                    left_sample,
+                    right_sample,
+                );
+                left_peak = left_peak.max(left_sample.abs());
+                right_peak = right_peak.max(right_sample.abs());
+            }
+
+            self.current_gain = target_gain;
+            self.current_pan = target_pan;
+            return (left_peak, right_peak);
+        }
+
+        let Some(reader) = self.reader.as_mut() else {
+            return (0.0, 0.0);
+        };
+
         for frame_offset in 0..frame_count {
             let dynamic_gain =
                 interpolated_gain(start_gain, target_gain, frame_offset, frame_count);
@@ -845,9 +1141,8 @@ impl MixClipState {
                 (overlap_start_frame - self.plan.timeline_start_frame) + frame_offset as u64;
             let edge_gain = self.plan.edge_gain(clip_frame_position);
 
-            let Some((left_sample, right_sample)) = self
-                .reader
-                .next_stereo_frame(dynamic_gain * edge_gain, dynamic_pan)
+            let Some((left_sample, right_sample)) =
+                reader.next_stereo_frame(dynamic_gain * edge_gain, dynamic_pan)
             else {
                 break;
             };
@@ -1092,6 +1387,27 @@ pub(crate) fn build_live_mix_map(song: &Song) -> HashMap<String, LiveTrackMix> {
         .iter()
         .map(|track| (track.id.clone(), LiveTrackMix::from_track(track)))
         .collect()
+}
+
+fn zero_latency_mode_enabled() -> bool {
+    #[cfg(test)]
+    if ZERO_LATENCY_TEST_MODE.load(std::sync::atomic::Ordering::SeqCst) {
+        return true;
+    }
+
+    std::env::var("LIBRETRACKS_ZERO_LATENCY_MODE")
+        .map(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes"
+            )
+        })
+        .unwrap_or(false)
+}
+
+#[cfg(test)]
+pub(crate) fn set_zero_latency_test_mode(enabled: bool) {
+    ZERO_LATENCY_TEST_MODE.store(enabled, std::sync::atomic::Ordering::SeqCst);
 }
 
 pub(crate) fn replace_shared_live_mix(

@@ -41,7 +41,7 @@ type ControlGroupProps = {
   summary?: string;
   open: boolean;
   onToggleOpen: () => void;
-  children: ReactNode;
+  children?: ReactNode;
   details?: ReactNode;
   action?: ReactNode;
   className?: string;

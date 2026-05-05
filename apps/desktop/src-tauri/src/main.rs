@@ -92,6 +92,7 @@ fn main() {
             commands::transport::pause_transport,
             commands::transport::stop_transport,
             commands::transport::seek_transport,
+            commands::transport::prewarm_timeline_seek,
             commands::transport::schedule_marker_jump,
             commands::transport::schedule_region_jump,
             commands::transport::cancel_marker_jump,

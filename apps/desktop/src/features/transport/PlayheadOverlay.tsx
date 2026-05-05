@@ -19,6 +19,7 @@ type PlayheadOverlayProps = {
   positionSecondsRef?: MutableRefObject<number>;
   normalizePositionSeconds?: (positionSeconds: number) => number;
   onPreviewPositionChange?: (positionSeconds: number) => void;
+  onSeekIntent?: (positionSeconds: number) => void;
   onSeekCommit?: (positionSeconds: number) => void | Promise<void>;
   positionBoundsRef?: MutableRefObject<HTMLDivElement | null>;
   scrollContainerRef?: MutableRefObject<HTMLDivElement | null>;
@@ -60,6 +61,7 @@ export function PlayheadOverlay({
   positionSecondsRef,
   normalizePositionSeconds,
   onPreviewPositionChange,
+  onSeekIntent,
   onSeekCommit,
   positionBoundsRef,
   scrollContainerRef,
@@ -79,6 +81,7 @@ export function PlayheadOverlay({
     positionSecondsRef,
     normalizePositionSeconds,
     onPreviewPositionChange,
+    onSeekIntent,
     onSeekCommit,
     positionBoundsRef,
     scrollContainerRef,
@@ -93,6 +96,7 @@ export function PlayheadOverlay({
     positionSecondsRef,
     normalizePositionSeconds,
     onPreviewPositionChange,
+    onSeekIntent,
     onSeekCommit,
     positionBoundsRef,
     scrollContainerRef,
@@ -194,6 +198,7 @@ export function PlayheadOverlay({
     };
     playheadRef.current?.classList.add("is-dragging");
     onPreviewPositionChange?.(startSeconds);
+    latestPropsRef.current.onSeekIntent?.(startSeconds);
 
     const onPointerMove = (pointerEvent: PointerEvent) => {
       const activeDrag = dragStateRef.current;
@@ -220,6 +225,7 @@ export function PlayheadOverlay({
         currentSeconds: normalizedSeconds,
       };
       onPreviewPositionChange?.(normalizedSeconds);
+      latestPropsRef.current.onSeekIntent?.(normalizedSeconds);
     };
 
     const finishDrag = (pointerEvent: PointerEvent) => {

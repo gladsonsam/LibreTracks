@@ -442,6 +442,7 @@ export function buildSongTempoRegions(song: SongView | null | undefined): SongTe
       endSeconds: marker.startSeconds,
       bpm,
       timeSignature,
+      transposeSemitones: 0,
     });
     startSeconds = marker.startSeconds;
     bpm = marker.bpm ?? bpm;
@@ -455,6 +456,7 @@ export function buildSongTempoRegions(song: SongView | null | undefined): SongTe
     endSeconds: Math.max(startSeconds, SONG_TEMPO_REGION_VISUAL_END_SECONDS),
     bpm,
     timeSignature,
+    transposeSemitones: 0,
   });
 
   return regions;

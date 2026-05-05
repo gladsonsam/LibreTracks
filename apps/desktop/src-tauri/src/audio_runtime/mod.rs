@@ -37,7 +37,7 @@ use self::backend::{
 #[cfg(test)]
 use self::mixer::{
     apply_runtime_pan, build_live_mix_map, build_playback_plans, interpolated_gain,
-    resolve_track_runtime_pan, PlaybackClipPlan,
+    resolve_track_runtime_pan, set_zero_latency_test_mode, PlaybackClipPlan,
 };
 use self::mixer::{replace_shared_live_mix, update_shared_track_mix, LiveTrackMix, Mixer};
 #[cfg(test)]
@@ -47,7 +47,8 @@ pub use self::telemetry::AudioDebugSnapshot;
 #[cfg(test)]
 use self::telemetry::{command_kind_label, env_flag};
 use self::telemetry::{
-    playback_reason_label, AudioDebugConfig, AudioDebugState, RestartReport, StopReport, SyncReport,
+    playback_reason_label, AudioDebugConfig, AudioDebugState, FarSeekTelemetry, RestartReport,
+    StopReport, SyncReport,
 };
 
 const PCM_RING_CAPACITY_FRAMES: usize = 4_096;
@@ -134,6 +135,12 @@ pub(crate) enum AudioCommand {
         song: Song,
         position_seconds: f64,
         reason: PlaybackStartReason,
+        respond_to: Sender<Result<(), String>>,
+    },
+    TimelineIntent {
+        song_dir: PathBuf,
+        song: Song,
+        position_seconds: f64,
         respond_to: Sender<Result<(), String>>,
     },
     SyncSong {
@@ -295,12 +302,20 @@ impl AudioRuntime {
         })
     }
 
-    fn seek(&mut self, song: &Song, position_seconds: f64) -> Result<usize, String> {
-        let updated_sinks = match self.session.as_mut() {
-            Some(session) => usize::from(session.seek(song.clone(), position_seconds)?),
-            None => 0,
-        };
-        Ok(updated_sinks)
+    fn seek(&mut self, song: &Song, position_seconds: f64) -> Result<SeekReport, String> {
+        match self.session.as_mut() {
+            Some(session) => session.seek(song.clone(), position_seconds),
+            None => Ok(SeekReport {
+                active_sinks: 0,
+                far_seek: FarSeekTelemetry {
+                    cache_status: "Silence".to_string(),
+                    exact_ready: false,
+                    used_fallback: true,
+                    prepare_requested: false,
+                    swap_to_exact_ms: None,
+                },
+            }),
+        }
     }
 
     fn start_master_fade(&mut self, target_gain: f32, duration_seconds: f64) -> Result<(), String> {
@@ -403,6 +418,20 @@ impl AudioController {
             song,
             position_seconds,
             reason,
+            respond_to,
+        })
+    }
+
+    pub fn on_timeline_hover_or_drag(
+        &self,
+        song_dir: PathBuf,
+        song: Song,
+        position_seconds: f64,
+    ) -> Result<(), DesktopError> {
+        self.request(|respond_to| AudioCommand::TimelineIntent {
+            song_dir,
+            song,
+            position_seconds,
             respond_to,
         })
     }
@@ -698,11 +727,38 @@ impl PlaybackSession {
         Ok(false)
     }
 
-    fn seek(&mut self, song: Song, position_seconds: f64) -> Result<bool, String> {
+    fn seek(&mut self, song: Song, position_seconds: f64) -> Result<SeekReport, String> {
+        let required_transpose = transpose_for_song_position(&song, position_seconds);
+        let decision = self.audio_buffers.get_best_source_for_seek(
+            &self.song_dir,
+            &song,
+            position_seconds,
+            required_transpose,
+        );
+        let decision_kind = decision.kind();
+        self.audio_buffers.record_recent_seek_and_reprioritize(
+            &self.song_dir,
+            &song,
+            position_seconds,
+            required_transpose,
+        );
         let generation = self
             .seek_generation
             .fetch_add(1, Ordering::AcqRel)
             .saturating_add(1);
+        let far_seek = FarSeekTelemetry {
+            cache_status: format!("{decision_kind:?}"),
+            exact_ready: matches!(
+                decision_kind,
+                source::SeekSourceKind::ExactRam | source::SeekSourceKind::ExactDisk
+            ),
+            used_fallback: decision.used_fallback(required_transpose),
+            prepare_requested: true,
+            swap_to_exact_ms: None,
+        };
+        if let Some(source) = decision.source() {
+            let _ = (source.sample_rate(), source.channels());
+        }
 
         if let Some(reader_sender) = &self.reader_sender {
             reader_sender
@@ -712,10 +768,16 @@ impl PlaybackSession {
                     generation,
                 })
                 .map_err(|_| "disk reader thread is unavailable".to_string())?;
-            return Ok(true);
+            return Ok(SeekReport {
+                active_sinks: 1,
+                far_seek,
+            });
         }
 
-        Ok(matches!(self.backend, PlaybackBackend::Null))
+        Ok(SeekReport {
+            active_sinks: usize::from(matches!(self.backend, PlaybackBackend::Null)),
+            far_seek,
+        })
     }
 
     fn play(&mut self, song: Song, position_seconds: f64) -> Result<bool, String> {
@@ -851,16 +913,35 @@ fn run_audio_thread(
                     &audio_settings,
                 )
                 .seek(&song, position_seconds)
-                .map(|active_sinks| {
+                .map(|report| {
                     debug_state.record_seek(
                         reason,
                         position_seconds,
                         song.duration_seconds,
-                        active_sinks.max(1),
+                        report.active_sinks.max(1),
+                        Some(&report.far_seek),
                     );
                 });
 
                 let _ = respond_to.send(result);
+            }
+            AudioCommand::TimelineIntent {
+                song_dir,
+                song,
+                position_seconds,
+                respond_to,
+            } => {
+                ensure_runtime(
+                    &mut runtime,
+                    &audio_buffers,
+                    &app_handle,
+                    &remote_handle,
+                    &live_mix_state,
+                    &audio_settings,
+                )
+                .audio_buffers
+                .on_timeline_hover_or_drag(&song_dir, &song, position_seconds);
+                let _ = respond_to.send(Ok(()));
             }
             AudioCommand::SyncSong { song, respond_to } => {
                 let (song, respond_tos, next_deferred) =
@@ -1116,6 +1197,22 @@ fn scheduled_clip_count(song: &Song, position_seconds: f64) -> usize {
         .count()
 }
 
+#[derive(Debug, Clone)]
+struct SeekReport {
+    active_sinks: usize,
+    far_seek: FarSeekTelemetry,
+}
+
+fn transpose_for_song_position(song: &Song, position_seconds: f64) -> i32 {
+    song.regions
+        .iter()
+        .find(|region| {
+            position_seconds >= region.start_seconds && position_seconds < region.end_seconds
+        })
+        .map(|region| region.transpose_semitones)
+        .unwrap_or(0)
+}
+
 fn seconds_to_frames(seconds: f64, sample_rate: u32) -> u64 {
     (seconds.max(0.0) * sample_rate.max(1) as f64).round() as u64
 }
@@ -1133,7 +1230,7 @@ mod tests {
         time::{Duration, Instant},
     };
 
-    use libretracks_core::{Clip, Song, SongRegion, Track};
+    use libretracks_core::{Clip, Marker, Song, SongRegion, Track};
     use rtrb::RingBuffer;
     use tempfile::tempdir;
 
@@ -1143,12 +1240,12 @@ mod tests {
         apply_runtime_pan, build_live_mix_map, build_playback_plans, coalesce_sync_song_commands,
         drain_consumer_samples, env_flag, interpolated_gain, playback_reason_label,
         prepare_audio_source, probe_audio_file, resolve_track_runtime_pan, scheduled_clip_count,
-        update_shared_track_mix, AudioBufferCache, AudioBufferCacheStats, AudioCommand,
-        AudioCommandKind, AudioController, AudioDebugConfig, AudioDebugSnapshot, AudioDebugState,
-        AudioMeterLevel, DiskReaderState, MemoryClipReader, Mixer, OutputSample, PlaybackBackend,
-        PlaybackClipPlan, PlaybackSession, PlaybackStartReason, ReaderCommand, RestartReport,
-        SharedAudioSource, StopReport, SyncReport, DISK_RENDER_BLOCK_FRAMES, GAIN_EPSILON,
-        STOP_FADE_DURATION_SECONDS,
+        set_zero_latency_test_mode, source, update_shared_track_mix, AudioBufferCache,
+        AudioBufferCacheStats, AudioCommand, AudioCommandKind, AudioController, AudioDebugConfig,
+        AudioDebugSnapshot, AudioDebugState, AudioMeterLevel, DiskReaderState, MemoryClipReader,
+        Mixer, OutputSample, PlaybackBackend, PlaybackClipPlan, PlaybackSession,
+        PlaybackStartReason, ReaderCommand, RestartReport, SharedAudioSource, StopReport,
+        SyncReport, DISK_RENDER_BLOCK_FRAMES, GAIN_EPSILON, STOP_FADE_DURATION_SECONDS,
     };
 
     fn demo_song() -> Song {
@@ -1221,6 +1318,27 @@ mod tests {
             ],
             section_markers: vec![],
         }
+    }
+
+    fn transposed_far_seek_song() -> Song {
+        let mut song = demo_song();
+        song.regions = vec![
+            SongRegion {
+                id: "region_intro".into(),
+                name: "Intro".into(),
+                start_seconds: 0.0,
+                end_seconds: 10.0,
+                transpose_semitones: 0,
+            },
+            SongRegion {
+                id: "region_far".into(),
+                name: "Far".into(),
+                start_seconds: 10.0,
+                end_seconds: 20.0,
+                transpose_semitones: 4,
+            },
+        ];
+        song
     }
 
     fn write_silent_test_wav(path: &std::path::Path) {
@@ -1340,9 +1458,8 @@ mod tests {
             let phase = frame % interval_frames.max(1);
             let sample = if phase < click_frames {
                 let envelope = 1.0 - (phase as f32 / click_frames.max(1) as f32);
-                let radians =
-                    2.0 * std::f32::consts::PI * click_frequency_hz * phase as f32
-                        / sample_rate.max(1) as f32;
+                let radians = 2.0 * std::f32::consts::PI * click_frequency_hz * phase as f32
+                    / sample_rate.max(1) as f32;
                 radians.cos() * envelope
             } else {
                 0.0
@@ -1436,7 +1553,9 @@ mod tests {
         const ENVELOPE_RADIUS: usize = 32;
 
         let start = center.saturating_sub(radius + max_shift);
-        let end = (center + radius + max_shift + 1).min(left.len()).min(right.len());
+        let end = (center + radius + max_shift + 1)
+            .min(left.len())
+            .min(right.len());
         let left_window = &left[start..end];
         let right_window = &right[start..end];
         let smooth_envelope = |window: &[f32]| {
@@ -1520,6 +1639,9 @@ mod tests {
                     cached_buffers: 1,
                     fully_cached_buffers: 1,
                     preload_bytes: 16,
+                    prepare_queue_len: 0,
+                    ram_cache_used_mb: 0,
+                    disk_cache_used_mb: 0,
                 },
             },
         );
@@ -1591,6 +1713,9 @@ mod tests {
                     cached_buffers: 1,
                     fully_cached_buffers: 0,
                     preload_bytes: 8,
+                    prepare_queue_len: 0,
+                    ram_cache_used_mb: 0,
+                    disk_cache_used_mb: 0,
                 },
             },
         );
@@ -1643,7 +1768,7 @@ mod tests {
             log_commands: false,
         });
 
-        debug_state.record_seek(PlaybackStartReason::Seek, 12.0, 8.0, 0);
+        debug_state.record_seek(PlaybackStartReason::Seek, 12.0, 8.0, 0, None);
 
         let snapshot = debug_state.snapshot();
 
@@ -2435,7 +2560,7 @@ mod tests {
     }
 
     #[test]
-    fn mixer_seek_crossfades_from_last_rendered_frame() {
+    fn mixer_seek_declick_fades_in_from_zero_without_last_output_frame() {
         let song = demo_song();
         let song_dir = PathBuf::from("song");
         let cache = AudioBufferCache::default();
@@ -2465,15 +2590,149 @@ mod tests {
             cache,
         );
 
-        let first_block = mixer.render_next_block(64);
-        let previous_tail = *first_block.last().expect("block should contain samples");
+        let _first_block = mixer.render_next_block(64);
 
         mixer.seek(song, 10.0);
-        let crossfaded_block = mixer.render_next_block(64);
+        let faded_block = mixer.render_next_block(64);
 
-        assert!((crossfaded_block[0] - previous_tail).abs() < 0.000_001);
-        assert!(crossfaded_block[1] < crossfaded_block[0]);
-        assert!(crossfaded_block[63] < crossfaded_block[1]);
+        assert!(faded_block[0].abs() < 0.000_001);
+        assert!(faded_block[1] < faded_block[0]);
+        assert!(faded_block[63] < faded_block[1]);
+    }
+
+    #[test]
+    fn mixer_uses_prepared_source_when_available() {
+        let song = demo_song();
+        let song_dir = PathBuf::from("song");
+        let prepared_path = song_dir.join("audio/late.wav");
+        let cache = AudioBufferCache::default();
+        cache.insert_prepared_ram_for_test(
+            source::PreparedAudioKey {
+                file_id: prepared_path.to_string_lossy().to_string(),
+                file_hash: prepared_path.to_string_lossy().to_string(),
+                sample_rate: 48_000,
+                channels: 1,
+                transpose_semitones: 0,
+            },
+            Arc::new(source::RawRamSource::new(vec![0.5; 48_000 * 5], 48_000, 1)),
+        );
+
+        let mut mixer = Mixer::new(
+            song_dir,
+            song.clone(),
+            10.0,
+            48_000,
+            1,
+            Arc::new(RwLock::new(None)),
+            Arc::new(RwLock::new(None)),
+            shared_mix_state(&song),
+            Arc::new(RwLock::new(AppSettings::default())),
+            AudioDebugConfig {
+                enabled: false,
+                log_commands: false,
+            },
+            cache,
+        );
+
+        assert_eq!(
+            mixer.active_clips()[0].source_kind(),
+            Some(source::SeekSourceKind::ExactRam)
+        );
+        let block = mixer.render_next_block(128);
+        assert!(block.iter().any(|sample| sample.abs() > 0.0));
+    }
+
+    #[test]
+    fn mixer_swaps_prepared_fallback_to_exact_with_crossfade() {
+        let mut song = demo_song();
+        song.regions[0].transpose_semitones = 2;
+        let song_dir = PathBuf::from("song");
+        let prepared_path = song_dir.join("audio/intro.wav");
+        let cache = AudioBufferCache::default();
+        let exact_key = source::PreparedAudioKey {
+            file_id: prepared_path.to_string_lossy().to_string(),
+            file_hash: prepared_path.to_string_lossy().to_string(),
+            sample_rate: 48_000,
+            channels: 1,
+            transpose_semitones: 2,
+        };
+        cache.insert_prepared_ram_for_test(
+            source::PreparedAudioKey {
+                transpose_semitones: 0,
+                ..exact_key.clone()
+            },
+            Arc::new(source::RawRamSource::new(vec![0.25; 48_000 * 5], 48_000, 1)),
+        );
+
+        let mut mixer = Mixer::new(
+            song_dir,
+            song.clone(),
+            0.0,
+            48_000,
+            1,
+            Arc::new(RwLock::new(None)),
+            Arc::new(RwLock::new(None)),
+            shared_mix_state(&song),
+            Arc::new(RwLock::new(AppSettings::default())),
+            AudioDebugConfig {
+                enabled: false,
+                log_commands: false,
+            },
+            cache.clone(),
+        );
+
+        assert_eq!(
+            mixer.active_clips()[0].source_kind(),
+            Some(source::SeekSourceKind::OriginalRam)
+        );
+        cache.insert_prepared_ram_for_test(
+            exact_key,
+            Arc::new(source::TransposedRamSource::new(
+                vec![0.5; 48_000 * 5],
+                48_000,
+                1,
+            )),
+        );
+
+        let block = mixer.render_next_block(1_024);
+
+        assert_eq!(
+            mixer.active_clips()[0].source_kind(),
+            Some(source::SeekSourceKind::ExactRam)
+        );
+        assert!(block.iter().any(|sample| *sample > 0.10));
+    }
+
+    #[test]
+    fn zero_latency_mode_uses_silence_instead_of_streaming_reader_when_unprepared() {
+        set_zero_latency_test_mode(true);
+        let song = demo_song();
+        let song_dir = PathBuf::from("song");
+        let mut mixer = Mixer::new(
+            song_dir,
+            song.clone(),
+            10.0,
+            48_000,
+            1,
+            Arc::new(RwLock::new(None)),
+            Arc::new(RwLock::new(None)),
+            shared_mix_state(&song),
+            Arc::new(RwLock::new(AppSettings::default())),
+            AudioDebugConfig {
+                enabled: false,
+                log_commands: false,
+            },
+            AudioBufferCache::default(),
+        );
+        set_zero_latency_test_mode(false);
+
+        assert_eq!(
+            mixer.active_clips()[0].source_kind(),
+            Some(source::SeekSourceKind::Silence)
+        );
+        assert_eq!(mixer.active_clips()[0].reader_current_frame(), 0);
+        let block = mixer.render_next_block(64);
+        assert!(block.iter().all(|sample| sample.abs() <= GAIN_EPSILON));
     }
 
     #[test]
@@ -2677,12 +2936,157 @@ mod tests {
             audio_buffers: AudioBufferCache::default(),
         };
 
-        let consumed_null_backend = session
+        let seek_report = session
             .seek(song, 8.0)
             .expect("seek should succeed on null backend");
 
-        assert!(consumed_null_backend);
+        assert_eq!(seek_report.active_sinks, 1);
         assert_eq!(seek_generation.load(Ordering::Acquire), 1);
+    }
+
+    #[test]
+    fn far_seek_to_exact_ram_is_immediate() {
+        let song = transposed_far_seek_song();
+        let song_dir = PathBuf::from("song");
+        let clip_path = song_dir.join("audio/late.wav");
+        let cache = AudioBufferCache::default();
+        cache.insert_hot_for_test(
+            clip_path,
+            4,
+            SharedAudioSource::from_preloaded(vec![0.2; 48_000], 48_000, 1, true),
+        );
+
+        let started_at = Instant::now();
+        let decision = cache.get_best_source_for_seek(&song_dir, &song, 11.0, 4);
+
+        assert_eq!(decision.kind(), source::SeekSourceKind::ExactRam);
+        assert!(started_at.elapsed() < Duration::from_millis(10));
+    }
+
+    #[test]
+    fn far_seek_to_exact_disk_is_immediate_and_non_blocking() {
+        let song = transposed_far_seek_song();
+        let song_dir = PathBuf::from("song");
+        let clip_path = song_dir.join("audio/late.wav");
+        let cache = AudioBufferCache::default();
+        cache.insert_prepared_disk_for_test(
+            clip_path,
+            4,
+            SharedAudioSource::from_preloaded(vec![0.2; 48_000], 48_000, 1, true),
+        );
+
+        let started_at = Instant::now();
+        let decision = cache.get_best_source_for_seek(&song_dir, &song, 11.0, 4);
+
+        assert_eq!(decision.kind(), source::SeekSourceKind::ExactDisk);
+        assert!(started_at.elapsed() < Duration::from_millis(10));
+    }
+
+    #[test]
+    fn far_seek_to_missing_transposed_source_falls_back_immediately() {
+        let song = transposed_far_seek_song();
+        let song_dir = PathBuf::from("song");
+        let clip_path = song_dir.join("audio/late.wav");
+        let cache = AudioBufferCache::default();
+        cache.insert_for_test(
+            clip_path,
+            SharedAudioSource::from_preloaded(vec![0.2; 48_000], 48_000, 1, true),
+        );
+
+        let decision = cache.get_best_source_for_seek(&song_dir, &song, 11.0, 4);
+
+        assert_eq!(decision.kind(), source::SeekSourceKind::OriginalDisk);
+        assert!(decision.used_fallback(4));
+    }
+
+    #[test]
+    fn far_seek_schedules_urgent_transposed_render() {
+        let song = transposed_far_seek_song();
+        let seek_generation = Arc::new(AtomicU64::new(0));
+        let mut session = PlaybackSession {
+            backend: PlaybackBackend::Null,
+            song_dir: PathBuf::from("song"),
+            reader_sender: None,
+            reader_handle: None,
+            seek_generation,
+            audio_buffers: AudioBufferCache::default(),
+        };
+
+        let report = session
+            .seek(song, 11.0)
+            .expect("far seek should schedule preparation");
+        let requests = session.audio_buffers.prepare_requests_for_test();
+
+        assert!(report.far_seek.prepare_requested);
+        assert_eq!(
+            requests[0].priority,
+            source::PreparePriority::RealtimeCritical
+        );
+        assert_eq!(requests[0].transpose_semitones, 4);
+    }
+
+    #[test]
+    fn seek_readiness_map_tracks_regions_markers_and_recent_positions() {
+        let mut song = transposed_far_seek_song();
+        song.section_markers.push(Marker {
+            id: "marker_far".into(),
+            name: "Far".into(),
+            start_seconds: 11.0,
+            digit: Some(1),
+        });
+        let song_dir = PathBuf::from("song");
+        let cache = AudioBufferCache::default();
+
+        cache.on_timeline_hover_or_drag(&song_dir, &song, 11.0);
+        let map = cache
+            .seek_readiness_map_for_test(&song.id)
+            .expect("readiness map should be built");
+
+        assert!(map
+            .hot_targets
+            .iter()
+            .any(|target| target.kind == source::SeekTargetKind::Marker));
+        assert_eq!(map.regions.len(), song.regions.len());
+        assert_eq!(map.last_user_positions, vec![11.0]);
+    }
+
+    #[test]
+    fn exact_source_swap_uses_seek_fade_in_not_last_output_frame() {
+        let song = demo_song();
+        let song_dir = PathBuf::from("song");
+        let cache = AudioBufferCache::default();
+        cache.insert_for_test(
+            song_dir.join("audio/intro.wav"),
+            SharedAudioSource::from_preloaded(vec![0.75; 48_000 * 5], 48_000, 1, true),
+        );
+        cache.insert_for_test(
+            song_dir.join("audio/late.wav"),
+            SharedAudioSource::from_preloaded(vec![-0.25; 48_000 * 5], 48_000, 1, true),
+        );
+
+        let mut mixer = Mixer::new(
+            song_dir,
+            song.clone(),
+            0.0,
+            48_000,
+            1,
+            Arc::new(RwLock::new(None)),
+            Arc::new(RwLock::new(None)),
+            shared_mix_state(&song),
+            Arc::new(RwLock::new(AppSettings::default())),
+            AudioDebugConfig {
+                enabled: false,
+                log_commands: false,
+            },
+            cache,
+        );
+
+        let _first_block = mixer.render_next_block(64);
+        mixer.seek(song, 10.0);
+        let faded_block = mixer.render_next_block(64);
+
+        assert!(faded_block[0].abs() < 0.000_001);
+        assert!(faded_block[1] < faded_block[0]);
     }
 
     #[test]

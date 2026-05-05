@@ -10,17 +10,21 @@ import {
 
 function buildTransfer(args?: { files?: File[]; items?: DataTransferItem[]; types?: string[] }) {
   const files = args?.files ?? [];
+  const indexedFiles = files.reduce<Record<number, File>>((accumulator, file, index) => {
+    accumulator[index] = file;
+    return accumulator;
+  }, {});
   const fileList = {
     length: files.length,
     item: (index: number) => files[index] ?? null,
-    ...files,
+    ...indexedFiles,
   } as unknown as FileList;
 
   return {
     files: fileList,
     items: args?.items ?? [],
     types: args?.types ?? [],
-  } as DataTransfer;
+  } as unknown as DataTransfer;
 }
 
 describe("dragDrop helpers", () => {

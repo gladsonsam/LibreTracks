@@ -1173,6 +1173,20 @@ impl DesktopSession {
         Ok(self.snapshot())
     }
 
+    pub fn on_timeline_hover_or_drag(
+        &mut self,
+        position_seconds: f64,
+        audio: &AudioController,
+    ) -> Result<(), DesktopError> {
+        let song_dir = self.song_dir.clone().ok_or(DesktopError::NoSongLoaded)?;
+        let song = self
+            .engine
+            .song()
+            .cloned()
+            .ok_or(DesktopError::NoSongLoaded)?;
+        audio.on_timeline_hover_or_drag(song_dir, song, position_seconds.max(0.0))
+    }
+
     pub fn schedule_marker_jump(
         &mut self,
         target_marker_id: &str,
@@ -1601,9 +1615,8 @@ impl DesktopSession {
             .find(|region| region.id == region_id)
             .ok_or_else(|| DesktopError::RegionNotFound(region_id.to_string()))?;
 
-        let record_history = self.should_record_transpose_history(TransposeHistoryTarget::Region(
-            region.id.clone(),
-        ));
+        let record_history =
+            self.should_record_transpose_history(TransposeHistoryTarget::Region(region.id.clone()));
 
         region.transpose_semitones = transpose_semitones;
 
@@ -1635,9 +1648,8 @@ impl DesktopSession {
             .find(|track| track.id == track_id)
             .ok_or_else(|| DesktopError::TrackNotFound(track_id.to_string()))?;
 
-        let record_history = self.should_record_transpose_history(TransposeHistoryTarget::Track(
-            track.id.clone(),
-        ));
+        let record_history =
+            self.should_record_transpose_history(TransposeHistoryTarget::Track(track.id.clone()));
 
         track.transpose_enabled = transpose_enabled;
 
@@ -2262,7 +2274,9 @@ impl DesktopSession {
             .ok_or(DesktopError::NoSongLoaded)?;
         audio.sync_live_mix(&loaded_song)?;
 
-        if playback_state == PlaybackState::Playing && matches!(impact, AudioChangeImpact::TransportOnly) {
+        if playback_state == PlaybackState::Playing
+            && matches!(impact, AudioChangeImpact::TransportOnly)
+        {
             audio.sync_song(loaded_song.clone())?;
         }
 
@@ -2332,13 +2346,10 @@ impl DesktopSession {
 
     fn should_record_transpose_history(&mut self, target: TransposeHistoryTarget) -> bool {
         let now = Instant::now();
-        let should_group = self
-            .transpose_history_group
-            .as_ref()
-            .is_some_and(|group| {
-                group.target == target
-                    && now.duration_since(group.recorded_at) <= Duration::from_millis(750)
-            });
+        let should_group = self.transpose_history_group.as_ref().is_some_and(|group| {
+            group.target == target
+                && now.duration_since(group.recorded_at) <= Duration::from_millis(750)
+        });
 
         self.transpose_history_group = Some(TransposeHistoryGroup {
             target,
@@ -2851,7 +2862,7 @@ fn sanitize_import_file_name(file_name: &str) -> Result<String, DesktopError> {
         .map(|value| value.trim().to_ascii_lowercase())
         .filter(|value| !value.is_empty())
         .ok_or_else(|| DesktopError::AudioCommand("imported file extension is invalid".into()))?;
-    let sanitized_stem = slugify(stem).replace('-', "_");
+    let sanitized_stem = slugify(stem);
 
     Ok(format!("{}.{}", sanitized_stem, extension))
 }
@@ -3930,8 +3941,8 @@ mod tests {
 
     use super::{
         build_empty_song, list_library_assets, write_library_manifest,
-        write_library_manifest_assets, AudioFileImportPayload, CreateClipRequest,
-        DesktopSession, TransportClock, WaveformMemoryCache,
+        write_library_manifest_assets, AudioFileImportPayload, CreateClipRequest, DesktopSession,
+        TransportClock, WaveformMemoryCache,
     };
 
     fn demo_song() -> Song {
@@ -4886,9 +4897,15 @@ mod tests {
             .expect("byte import should succeed");
 
         assert_eq!(imported_assets.len(), 2);
-        assert!(imported_assets.iter().any(|asset| asset.file_path == "audio/dropped-a.wav"));
-        assert!(imported_assets.iter().any(|asset| asset.file_path == "audio/dropped-b.wav"));
-        assert!(imported_assets.iter().all(|asset| asset.file_name.starts_with("dropped-")));
+        assert!(imported_assets
+            .iter()
+            .any(|asset| asset.file_path == "audio/dropped-a.wav"));
+        assert!(imported_assets
+            .iter()
+            .any(|asset| asset.file_path == "audio/dropped-b.wav"));
+        assert!(imported_assets
+            .iter()
+            .all(|asset| asset.file_name.starts_with("dropped-")));
 
         let all_assets = session
             .get_library_assets()
@@ -4942,16 +4959,22 @@ mod tests {
             .library_assets
             .iter()
             .find(|asset| asset.file_path == "audio/test.wav")
-            .unwrap_or_else(|| panic!("missing imported asset in response: {:?}", result.library_assets));
+            .unwrap_or_else(|| {
+                panic!(
+                    "missing imported asset in response: {:?}",
+                    result.library_assets
+                )
+            });
         assert!(imported_asset.is_missing);
 
         let song_view = session
             .song_view()
             .expect("song view should build")
             .expect("song should exist");
-        assert!(song_view.clips.iter().any(|clip| {
-            clip.file_path == "audio/test.wav" && clip.is_missing
-        }));
+        assert!(song_view
+            .clips
+            .iter()
+            .any(|clip| { clip.file_path == "audio/test.wav" && clip.is_missing }));
         assert_eq!(result.snapshot.project_revision, song_view.project_revision);
     }
 

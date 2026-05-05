@@ -89,6 +89,21 @@ pub fn seek_transport(
 }
 
 #[tauri::command]
+pub fn prewarm_timeline_seek(
+    position_seconds: f64,
+    state: State<'_, DesktopState>,
+) -> Result<(), String> {
+    let mut session = state
+        .session
+        .lock()
+        .map_err(|_| DesktopError::StatePoisoned.to_string())?;
+
+    session
+        .on_timeline_hover_or_drag(position_seconds, &state.audio)
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
 pub fn schedule_marker_jump(
     target_marker_id: String,
     settings_store: State<'_, AppSettingsStore>,

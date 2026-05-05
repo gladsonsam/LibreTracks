@@ -48,6 +48,24 @@ pub(crate) struct AudioRuntimeStateSummary {
     pub fully_cached_audio_buffers: usize,
     pub cached_audio_preload_bytes: usize,
     pub master_gain: f32,
+    pub far_seek_cache_status: Option<String>,
+    pub far_seek_exact_ready: bool,
+    pub far_seek_used_fallback: bool,
+    pub far_seek_prepare_requested: bool,
+    pub far_seek_swap_to_exact_ms: Option<f64>,
+    pub last_seek_path: Option<String>,
+    pub last_seek_exact_pitch_hit: bool,
+    pub last_seek_fallback_used: bool,
+    pub last_seek_source_waited: bool,
+    pub source_swap_ms_after_seek: Option<f64>,
+    pub starved_frames: u64,
+    pub streaming_reader_used_in_zero_latency_mode: bool,
+    pub ram_cache_used_mb: usize,
+    pub disk_cache_used_mb: usize,
+    pub prepare_queue_len: usize,
+    pub prepare_active_tasks: usize,
+    pub prepare_cancelled_tasks: usize,
+    pub source_swap_count: u64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -114,6 +132,24 @@ impl Default for AudioRuntimeStateSummary {
             fully_cached_audio_buffers: 0,
             cached_audio_preload_bytes: 0,
             master_gain: 1.0,
+            far_seek_cache_status: None,
+            far_seek_exact_ready: false,
+            far_seek_used_fallback: false,
+            far_seek_prepare_requested: false,
+            far_seek_swap_to_exact_ms: None,
+            last_seek_path: None,
+            last_seek_exact_pitch_hit: false,
+            last_seek_fallback_used: false,
+            last_seek_source_waited: false,
+            source_swap_ms_after_seek: None,
+            starved_frames: 0,
+            streaming_reader_used_in_zero_latency_mode: false,
+            ram_cache_used_mb: 0,
+            disk_cache_used_mb: 0,
+            prepare_queue_len: 0,
+            prepare_active_tasks: 0,
+            prepare_cancelled_tasks: 0,
+            source_swap_count: 0,
         }
     }
 }
@@ -176,6 +212,9 @@ impl AudioDebugState {
         self.runtime_state.cached_audio_buffers = report.cache_stats.cached_buffers;
         self.runtime_state.fully_cached_audio_buffers = report.cache_stats.fully_cached_buffers;
         self.runtime_state.cached_audio_preload_bytes = report.cache_stats.preload_bytes;
+        self.runtime_state.prepare_queue_len = report.cache_stats.prepare_queue_len;
+        self.runtime_state.ram_cache_used_mb = report.cache_stats.ram_cache_used_mb;
+        self.runtime_state.disk_cache_used_mb = report.cache_stats.disk_cache_used_mb;
         self.playback_anchor_position_seconds = Some(position_seconds.max(0.0));
         self.playback_anchor_started_at = Some(Instant::now());
         self.playback_song_duration_seconds = Some(song_duration_seconds.max(0.0));
@@ -216,12 +255,25 @@ impl AudioDebugState {
         position_seconds: f64,
         song_duration_seconds: f64,
         active_sinks: usize,
+        far_seek: Option<&FarSeekTelemetry>,
     ) {
         self.runtime_state.active_sinks = active_sinks;
         self.playback_anchor_position_seconds = Some(position_seconds.max(0.0));
         self.playback_anchor_started_at = Some(Instant::now());
         self.playback_song_duration_seconds = Some(song_duration_seconds.max(0.0));
         self.last_start_reason = Some(reason);
+        if let Some(far_seek) = far_seek {
+            self.runtime_state.far_seek_cache_status = Some(far_seek.cache_status.clone());
+            self.runtime_state.far_seek_exact_ready = far_seek.exact_ready;
+            self.runtime_state.far_seek_used_fallback = far_seek.used_fallback;
+            self.runtime_state.far_seek_prepare_requested = far_seek.prepare_requested;
+            self.runtime_state.far_seek_swap_to_exact_ms = far_seek.swap_to_exact_ms;
+            self.runtime_state.last_seek_path = Some(far_seek.cache_status.clone());
+            self.runtime_state.last_seek_exact_pitch_hit = far_seek.exact_ready;
+            self.runtime_state.last_seek_fallback_used = far_seek.used_fallback;
+            self.runtime_state.last_seek_source_waited = false;
+            self.runtime_state.source_swap_ms_after_seek = far_seek.swap_to_exact_ms;
+        }
     }
 
     pub(crate) fn record_stop(&mut self, report: &StopReport, active_sinks_after_stop: usize) {
@@ -309,4 +361,13 @@ pub(crate) fn command_kind_label(kind: AudioCommandKind) -> &'static str {
         AudioCommandKind::DebugSnapshot => "debug_snapshot",
         AudioCommandKind::Shutdown => "shutdown",
     }
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct FarSeekTelemetry {
+    pub cache_status: String,
+    pub exact_ready: bool,
+    pub used_fallback: bool,
+    pub prepare_requested: bool,
+    pub swap_to_exact_ms: Option<f64>,
 }

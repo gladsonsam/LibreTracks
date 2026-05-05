@@ -300,6 +300,10 @@ export async function seekTransport(positionSeconds: number): Promise<TransportS
   return invokeCommand<TransportSnapshot>("seek_transport", { positionSeconds });
 }
 
+export async function prewarmTimelineSeek(positionSeconds: number): Promise<void> {
+  await invokeCommand("prewarm_timeline_seek", { positionSeconds });
+}
+
 export async function scheduleMarkerJump(
   targetMarkerId: string,
 ): Promise<TransportSnapshot> {

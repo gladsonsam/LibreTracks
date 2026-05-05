@@ -2,9 +2,17 @@ use super::*;
 use libretracks_project::load_waveform_summary;
 use rayon::prelude::*;
 use rtrb::{Consumer, Producer, RingBuffer};
-use std::{collections::HashSet, fs::File};
+#[cfg(unix)]
+use std::os::unix::fs::FileExt;
+#[cfg(windows)]
+use std::os::windows::fs::FileExt;
 #[cfg(test)]
 use std::time::Instant;
+use std::{
+    collections::HashSet,
+    fs::{self, File},
+    io::{Read, Write},
+};
 use symphonia::core::{
     audio::SampleBuffer,
     codecs::{DecoderOptions, CODEC_TYPE_NULL},
@@ -20,17 +28,29 @@ const STREAM_SECONDS_PER_CLIP: usize = 2;
 const STREAM_WORKER_CHUNK_FRAMES: usize = 512;
 const STREAM_WORKER_READY_TIMEOUT: Duration = Duration::from_millis(250);
 const PITCH_ALIGNMENT_TRIM_FRAMES: usize = 7;
+const LTAF_MAGIC: &[u8; 4] = b"LTAF";
+const LTAF_VERSION: u32 = 1;
+const LTAF_HEADER_LEN: u64 = 64;
 
 #[derive(Debug, Clone, Copy, Default)]
 pub(crate) struct AudioBufferCacheStats {
     pub cached_buffers: usize,
     pub fully_cached_buffers: usize,
     pub preload_bytes: usize,
+    pub prepare_queue_len: usize,
+    pub ram_cache_used_mb: usize,
+    pub disk_cache_used_mb: usize,
 }
 
 #[derive(Clone, Default)]
 pub(crate) struct AudioBufferCache {
     entries: Arc<RwLock<HashMap<PathBuf, Arc<StreamingAudioSource>>>>,
+    prepared_audio: PreparedAudioCache,
+    hot_entries: Arc<RwLock<HashMap<LegacyPreparedAudioKey, Arc<StreamingAudioSource>>>>,
+    prepared_disk_entries: Arc<RwLock<HashMap<LegacyPreparedAudioKey, Arc<StreamingAudioSource>>>>,
+    previous_pitch_entries: Arc<RwLock<HashMap<PathBuf, (i32, Arc<StreamingAudioSource>)>>>,
+    seek_readiness_maps: Arc<RwLock<HashMap<SongId, SeekReadinessMap>>>,
+    prepare_requests: Arc<RwLock<Vec<PrepareRequest>>>,
 }
 
 #[derive(Debug)]
@@ -46,6 +66,203 @@ pub(crate) struct StreamingAudioSource {
 pub(crate) struct SeekIndexEntry {
     pub timestamp: u64,
     pub packet_offset: u64,
+}
+
+pub(crate) type SongId = String;
+pub(crate) type TimelinePosition = f64;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RegionReadiness {
+    ExactRam,
+    ExactDisk,
+    OriginalRam,
+    OriginalDisk,
+    Missing,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SeekTargetKind {
+    CurrentPlayhead,
+    RegionStart,
+    RegionEnd,
+    Marker,
+    LoopPoint,
+    RecentSeek,
+    TimelineIntent,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct SeekTarget {
+    pub position: TimelinePosition,
+    pub kind: SeekTargetKind,
+    pub readiness: RegionReadiness,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct RegionReadinessEntry {
+    pub region_id: String,
+    pub start: TimelinePosition,
+    pub end: TimelinePosition,
+    pub readiness: RegionReadiness,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct SeekReadinessMap {
+    pub song_id: SongId,
+    pub hot_targets: Vec<SeekTarget>,
+    pub regions: Vec<RegionReadinessEntry>,
+    pub last_user_positions: Vec<TimelinePosition>,
+}
+
+pub(crate) trait PreparedAudioSource: Send + Sync {
+    fn sample_rate(&self) -> u32;
+    fn channels(&self) -> usize;
+    fn frame_count(&self) -> u64;
+    fn read_interleaved_at(&self, source_frame: u64, output: &mut [f32]) -> usize;
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct RawRamSource {
+    samples: Arc<[f32]>,
+    sample_rate: u32,
+    channels: usize,
+    frame_count: u64,
+}
+
+#[derive(Debug)]
+pub(crate) struct RawDiskSource {
+    file: Arc<File>,
+    sample_rate: u32,
+    channels: usize,
+    frame_count: u64,
+    payload_offset: u64,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct TransposedRamSource {
+    inner: RawRamSource,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct SilentSource {
+    sample_rate: u32,
+    channels: usize,
+    frame_count: u64,
+}
+
+#[derive(Clone, Hash, Eq, PartialEq, Debug)]
+pub(crate) struct PreparedAudioKey {
+    pub file_id: String,
+    pub file_hash: String,
+    pub sample_rate: u32,
+    pub channels: usize,
+    pub transpose_semitones: i32,
+}
+
+#[derive(Clone, Hash, Eq, PartialEq, Debug)]
+pub(crate) struct PreparedWindowKey {
+    pub audio_key: PreparedAudioKey,
+    pub start_frame: u64,
+    pub end_frame: u64,
+}
+
+#[derive(Clone)]
+pub(crate) enum PreparedState {
+    ReadyRam(Arc<dyn PreparedAudioSource>),
+    ReadyDisk(Arc<dyn PreparedAudioSource>),
+    Preparing,
+    Missing,
+    Failed(String),
+}
+
+pub(crate) enum SeekSourceDecision {
+    ExactRam(Arc<dyn PreparedAudioSource>),
+    ExactDisk(Arc<dyn PreparedAudioSource>),
+    OriginalRam(Arc<dyn PreparedAudioSource>),
+    OriginalDisk(Arc<dyn PreparedAudioSource>),
+    PreviousPitch(Arc<dyn PreparedAudioSource>),
+    Silence,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SeekSourceKind {
+    ExactRam,
+    ExactDisk,
+    OriginalRam,
+    OriginalDisk,
+    PreviousPitch,
+    Silence,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PreparePriority {
+    RealtimeCritical,
+    CurrentPlayback,
+    HotSeekTarget,
+    CurrentSong,
+    NextSong,
+    Background,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct PrepareRequest {
+    pub song_id: SongId,
+    pub position: TimelinePosition,
+    pub transpose_semitones: i32,
+    pub window_seconds: f64,
+    pub priority: PreparePriority,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct PrepareWindowConfig {
+    pub current_ahead_seconds: f32,
+    pub current_behind_seconds: f32,
+    pub seek_target_radius_seconds: f32,
+    pub hover_radius_seconds: f32,
+    pub urgent_window_seconds: f32,
+}
+
+impl Default for PrepareWindowConfig {
+    fn default() -> Self {
+        Self {
+            current_ahead_seconds: 30.0,
+            current_behind_seconds: 5.0,
+            seek_target_radius_seconds: 5.0,
+            hover_radius_seconds: 4.0,
+            urgent_window_seconds: 5.0,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct RamCacheConfig {
+    pub max_mb: usize,
+    pub min_free_system_mb: usize,
+    pub window_seconds: f32,
+}
+
+impl Default for RamCacheConfig {
+    fn default() -> Self {
+        Self {
+            max_mb: 512,
+            min_free_system_mb: 512,
+            window_seconds: 5.0,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct RamWindowEntry {
+    key: PreparedWindowKey,
+    bytes: usize,
+    priority_weight: u8,
+    last_used_tick: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct LegacyPreparedAudioKey {
+    file_path: PathBuf,
+    transpose_semitones: i32,
 }
 
 pub(crate) struct StreamingClipReader {
@@ -160,13 +377,618 @@ impl StreamingAudioSource {
     }
 }
 
+impl PreparedAudioSource for StreamingAudioSource {
+    fn sample_rate(&self) -> u32 {
+        self.sample_rate()
+    }
+
+    fn channels(&self) -> usize {
+        self.channels()
+    }
+
+    fn frame_count(&self) -> u64 {
+        self.frame_count as u64
+    }
+
+    fn read_interleaved_at(&self, _source_frame: u64, _output: &mut [f32]) -> usize {
+        0
+    }
+}
+
+impl RawRamSource {
+    pub(crate) fn new(samples: Vec<f32>, sample_rate: u32, channels: usize) -> Self {
+        let channels = channels.max(1);
+        let frame_count = (samples.len() / channels) as u64;
+        Self {
+            samples: Arc::from(samples),
+            sample_rate: sample_rate.max(1),
+            channels,
+            frame_count,
+        }
+    }
+}
+
+impl PreparedAudioSource for RawRamSource {
+    fn sample_rate(&self) -> u32 {
+        self.sample_rate
+    }
+
+    fn channels(&self) -> usize {
+        self.channels
+    }
+
+    fn frame_count(&self) -> u64 {
+        self.frame_count
+    }
+
+    fn read_interleaved_at(&self, source_frame: u64, output: &mut [f32]) -> usize {
+        let channels = self.channels.max(1);
+        let requested_frames = output.len() / channels;
+        if requested_frames == 0 || source_frame >= self.frame_count {
+            return 0;
+        }
+
+        let available_frames = (self.frame_count - source_frame) as usize;
+        let frames_to_copy = requested_frames.min(available_frames);
+        let source_start = source_frame as usize * channels;
+        let sample_count = frames_to_copy * channels;
+        output[..sample_count]
+            .copy_from_slice(&self.samples[source_start..source_start + sample_count]);
+        frames_to_copy
+    }
+}
+
+impl RawDiskSource {
+    pub(crate) fn open_ltaf(path: &Path) -> Result<Self, String> {
+        let mut header_file = File::open(path).map_err(|error| error.to_string())?;
+        let mut header = [0_u8; LTAF_HEADER_LEN as usize];
+        header_file
+            .read_exact(&mut header)
+            .map_err(|error| error.to_string())?;
+        if &header[0..4] != LTAF_MAGIC {
+            return Err("invalid LTAF magic".to_string());
+        }
+
+        let version = u32::from_le_bytes(header[4..8].try_into().expect("version bytes"));
+        if version != LTAF_VERSION {
+            return Err(format!("unsupported LTAF version: {version}"));
+        }
+
+        let sample_rate = u32::from_le_bytes(header[8..12].try_into().expect("sample rate bytes"));
+        let channels =
+            u32::from_le_bytes(header[12..16].try_into().expect("channel bytes")) as usize;
+        let frame_count = u64::from_le_bytes(header[16..24].try_into().expect("frame count bytes"));
+        let file = File::open(path).map_err(|error| error.to_string())?;
+
+        Ok(Self {
+            file: Arc::new(file),
+            sample_rate: sample_rate.max(1),
+            channels: channels.max(1),
+            frame_count,
+            payload_offset: LTAF_HEADER_LEN,
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn write_ltaf_for_test(
+        path: &Path,
+        samples: &[f32],
+        sample_rate: u32,
+        channels: usize,
+    ) -> Result<(), String> {
+        write_ltaf_file(path, samples, sample_rate, channels)
+    }
+}
+
+impl PreparedAudioSource for RawDiskSource {
+    fn sample_rate(&self) -> u32 {
+        self.sample_rate
+    }
+
+    fn channels(&self) -> usize {
+        self.channels
+    }
+
+    fn frame_count(&self) -> u64 {
+        self.frame_count
+    }
+
+    fn read_interleaved_at(&self, source_frame: u64, output: &mut [f32]) -> usize {
+        let channels = self.channels.max(1);
+        let requested_frames = output.len() / channels;
+        if requested_frames == 0 || source_frame >= self.frame_count {
+            return 0;
+        }
+
+        let frames_to_read = requested_frames.min((self.frame_count - source_frame) as usize);
+        let samples_to_read = frames_to_read * channels;
+        let mut bytes = vec![0_u8; samples_to_read * size_of::<f32>()];
+        let byte_offset = self.payload_offset.saturating_add(
+            source_frame
+                .saturating_mul(channels as u64)
+                .saturating_mul(4),
+        );
+
+        let Ok(bytes_read) = file_read_at(&self.file, &mut bytes, byte_offset) else {
+            return 0;
+        };
+        let whole_samples = bytes_read / size_of::<f32>();
+        let frames_read = (whole_samples / channels).min(frames_to_read);
+        for sample_index in 0..(frames_read * channels) {
+            let byte_index = sample_index * 4;
+            output[sample_index] = f32::from_le_bytes(
+                bytes[byte_index..byte_index + 4]
+                    .try_into()
+                    .expect("sample bytes"),
+            );
+        }
+        frames_read
+    }
+}
+
+impl TransposedRamSource {
+    pub(crate) fn new(samples: Vec<f32>, sample_rate: u32, channels: usize) -> Self {
+        Self {
+            inner: RawRamSource::new(samples, sample_rate, channels),
+        }
+    }
+}
+
+impl PreparedAudioSource for TransposedRamSource {
+    fn sample_rate(&self) -> u32 {
+        self.inner.sample_rate()
+    }
+
+    fn channels(&self) -> usize {
+        self.inner.channels()
+    }
+
+    fn frame_count(&self) -> u64 {
+        self.inner.frame_count()
+    }
+
+    fn read_interleaved_at(&self, source_frame: u64, output: &mut [f32]) -> usize {
+        self.inner.read_interleaved_at(source_frame, output)
+    }
+}
+
+impl SilentSource {
+    pub(crate) fn new(sample_rate: u32, channels: usize, frame_count: u64) -> Self {
+        Self {
+            sample_rate: sample_rate.max(1),
+            channels: channels.max(1),
+            frame_count,
+        }
+    }
+}
+
+impl PreparedAudioSource for SilentSource {
+    fn sample_rate(&self) -> u32 {
+        self.sample_rate
+    }
+
+    fn channels(&self) -> usize {
+        self.channels
+    }
+
+    fn frame_count(&self) -> u64 {
+        self.frame_count
+    }
+
+    fn read_interleaved_at(&self, source_frame: u64, output: &mut [f32]) -> usize {
+        if source_frame >= self.frame_count {
+            return 0;
+        }
+        let frames =
+            (output.len() / self.channels.max(1)).min((self.frame_count - source_frame) as usize);
+        output[..frames * self.channels.max(1)].fill(0.0);
+        frames
+    }
+}
+
+impl SeekSourceDecision {
+    pub(crate) fn source(&self) -> Option<&dyn PreparedAudioSource> {
+        match self {
+            Self::ExactRam(source)
+            | Self::ExactDisk(source)
+            | Self::OriginalRam(source)
+            | Self::OriginalDisk(source)
+            | Self::PreviousPitch(source) => Some(source.as_ref()),
+            Self::Silence => None,
+        }
+    }
+
+    pub(crate) fn kind(&self) -> SeekSourceKind {
+        match self {
+            Self::ExactRam(_) => SeekSourceKind::ExactRam,
+            Self::ExactDisk(_) => SeekSourceKind::ExactDisk,
+            Self::OriginalRam(_) => SeekSourceKind::OriginalRam,
+            Self::OriginalDisk(_) => SeekSourceKind::OriginalDisk,
+            Self::PreviousPitch(_) => SeekSourceKind::PreviousPitch,
+            Self::Silence => SeekSourceKind::Silence,
+        }
+    }
+
+    pub(crate) fn used_fallback(&self, required_transpose: i32) -> bool {
+        let _ = required_transpose;
+        !matches!(self, Self::ExactRam(_) | Self::ExactDisk(_))
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct PreparedAudioCache {
+    states: Arc<RwLock<HashMap<PreparedAudioKey, PreparedState>>>,
+    previous_pitch: Arc<RwLock<HashMap<String, Arc<dyn PreparedAudioSource>>>>,
+    ram_windows: Arc<RwLock<HashMap<PreparedWindowKey, RamWindowEntry>>>,
+    prepare_queue: Arc<RwLock<Vec<PrepareRequest>>>,
+    tick: Arc<AtomicU64>,
+    ram_config: RamCacheConfig,
+    silent_source: Arc<SilentSource>,
+}
+
+impl Default for PreparedAudioCache {
+    fn default() -> Self {
+        Self {
+            states: Arc::new(RwLock::new(HashMap::new())),
+            previous_pitch: Arc::new(RwLock::new(HashMap::new())),
+            ram_windows: Arc::new(RwLock::new(HashMap::new())),
+            prepare_queue: Arc::new(RwLock::new(Vec::new())),
+            tick: Arc::new(AtomicU64::new(0)),
+            ram_config: RamCacheConfig::default(),
+            silent_source: Arc::new(SilentSource::new(48_000, 2, u64::MAX)),
+        }
+    }
+}
+
+impl PreparedAudioCache {
+    pub(crate) fn get_exact(
+        &self,
+        key: &PreparedAudioKey,
+        frame: u64,
+    ) -> Option<Arc<dyn PreparedAudioSource>> {
+        let states = self.states.try_read().ok()?;
+        let source = match states.get(key)? {
+            PreparedState::ReadyRam(source) | PreparedState::ReadyDisk(source) => source.clone(),
+            PreparedState::Preparing | PreparedState::Missing | PreparedState::Failed(_) => {
+                return None
+            }
+        };
+        (frame < source.frame_count()).then_some(source)
+    }
+
+    pub(crate) fn get_original(
+        &self,
+        key: &PreparedAudioKey,
+        frame: u64,
+    ) -> Option<Arc<dyn PreparedAudioSource>> {
+        let original_key = PreparedAudioKey {
+            transpose_semitones: 0,
+            ..key.clone()
+        };
+        self.get_exact(&original_key, frame)
+    }
+
+    pub(crate) fn get_best_available(
+        &self,
+        key: &PreparedAudioKey,
+        frame: u64,
+    ) -> SeekSourceDecision {
+        if let Some(source) = self.get_exact(key, frame) {
+            return match self.state_kind(key) {
+                Some(SeekSourceKind::ExactDisk) => SeekSourceDecision::ExactDisk(source),
+                _ => SeekSourceDecision::ExactRam(source),
+            };
+        }
+
+        if let Some(source) = self.get_original(key, frame) {
+            return match self.state_kind(&PreparedAudioKey {
+                transpose_semitones: 0,
+                ..key.clone()
+            }) {
+                Some(SeekSourceKind::ExactDisk) => SeekSourceDecision::OriginalDisk(source),
+                _ => SeekSourceDecision::OriginalRam(source),
+            };
+        }
+
+        if let Ok(previous_pitch) = self.previous_pitch.try_read() {
+            if let Some(source) = previous_pitch.get(&key.file_id).cloned() {
+                if frame < source.frame_count() {
+                    return SeekSourceDecision::PreviousPitch(source);
+                }
+            }
+        }
+
+        SeekSourceDecision::Silence
+    }
+
+    pub(crate) fn mark_preparing(&self, key: PreparedAudioKey) {
+        if let Ok(mut states) = self.states.write() {
+            states.insert(key, PreparedState::Preparing);
+        }
+    }
+
+    pub(crate) fn insert_ready_ram(
+        &self,
+        key: PreparedAudioKey,
+        source: Arc<dyn PreparedAudioSource>,
+    ) {
+        if key.transpose_semitones != 0 {
+            if let Ok(mut previous_pitch) = self.previous_pitch.write() {
+                previous_pitch.insert(key.file_id.clone(), source.clone());
+            }
+        }
+        if let Ok(mut states) = self.states.write() {
+            states.insert(key, PreparedState::ReadyRam(source));
+        }
+    }
+
+    pub(crate) fn insert_ready_disk(
+        &self,
+        key: PreparedAudioKey,
+        source: Arc<dyn PreparedAudioSource>,
+    ) {
+        if key.transpose_semitones != 0 {
+            if let Ok(mut previous_pitch) = self.previous_pitch.write() {
+                previous_pitch.insert(key.file_id.clone(), source.clone());
+            }
+        }
+        if let Ok(mut states) = self.states.write() {
+            states.insert(key, PreparedState::ReadyDisk(source));
+        }
+    }
+
+    pub(crate) fn insert_missing(&self, key: PreparedAudioKey) {
+        if let Ok(mut states) = self.states.write() {
+            states.insert(key, PreparedState::Missing);
+        }
+    }
+
+    pub(crate) fn insert_failed(&self, key: PreparedAudioKey, error: String) {
+        if let Ok(mut states) = self.states.write() {
+            states.insert(key, PreparedState::Failed(error));
+        }
+    }
+
+    pub(crate) fn request_prepare(&self, request: PrepareRequest) {
+        if let Ok(mut queue) = self.prepare_queue.write() {
+            queue.push(request);
+            queue.sort_by_key(|request| prepare_priority_rank(request.priority));
+            const MAX_PREPARE_QUEUE: usize = 512;
+            if queue.len() > MAX_PREPARE_QUEUE {
+                queue.truncate(MAX_PREPARE_QUEUE);
+            }
+        }
+    }
+
+    pub(crate) fn prepare_queue_len(&self) -> usize {
+        self.prepare_queue
+            .try_read()
+            .map(|queue| queue.len())
+            .unwrap_or_default()
+    }
+
+    pub(crate) fn insert_ram_window(
+        &self,
+        key: PreparedWindowKey,
+        bytes: usize,
+        priority_weight: u8,
+    ) {
+        let tick = self.tick.fetch_add(1, Ordering::AcqRel).saturating_add(1);
+        if let Ok(mut windows) = self.ram_windows.write() {
+            windows.insert(
+                key.clone(),
+                RamWindowEntry {
+                    key,
+                    bytes,
+                    priority_weight,
+                    last_used_tick: tick,
+                },
+            );
+            self.evict_ram_windows_locked(&mut windows);
+        }
+    }
+
+    pub(crate) fn ram_cache_used_mb(&self) -> usize {
+        self.ram_windows
+            .try_read()
+            .map(|windows| windows.values().map(|entry| entry.bytes).sum::<usize>() / (1024 * 1024))
+            .unwrap_or_default()
+    }
+
+    fn evict_ram_windows_locked(&self, windows: &mut HashMap<PreparedWindowKey, RamWindowEntry>) {
+        let max_bytes = self.ram_config.max_mb.saturating_mul(1024 * 1024);
+        while windows.values().map(|entry| entry.bytes).sum::<usize>() > max_bytes {
+            let Some(victim_key) = windows
+                .values()
+                .filter(|entry| entry.priority_weight < 90)
+                .min_by_key(|entry| (entry.priority_weight, entry.last_used_tick))
+                .map(|entry| entry.key.clone())
+            else {
+                break;
+            };
+            windows.remove(&victim_key);
+        }
+    }
+
+    pub(crate) fn source_or_silence(
+        &self,
+        decision: &SeekSourceDecision,
+    ) -> Arc<dyn PreparedAudioSource> {
+        match decision {
+            SeekSourceDecision::ExactRam(source)
+            | SeekSourceDecision::ExactDisk(source)
+            | SeekSourceDecision::OriginalRam(source)
+            | SeekSourceDecision::OriginalDisk(source)
+            | SeekSourceDecision::PreviousPitch(source) => source.clone(),
+            SeekSourceDecision::Silence => self.silent_source.clone(),
+        }
+    }
+
+    fn state_kind(&self, key: &PreparedAudioKey) -> Option<SeekSourceKind> {
+        let states = self.states.try_read().ok()?;
+        match states.get(key)? {
+            PreparedState::ReadyRam(_) => Some(SeekSourceKind::ExactRam),
+            PreparedState::ReadyDisk(_) => Some(SeekSourceKind::ExactDisk),
+            PreparedState::Preparing | PreparedState::Missing | PreparedState::Failed(_) => None,
+        }
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct AudioPrepareManager {
+    cache: PreparedAudioCache,
+    window_config: PrepareWindowConfig,
+}
+
+impl AudioPrepareManager {
+    pub(crate) fn new(cache: PreparedAudioCache) -> Self {
+        Self {
+            cache,
+            window_config: PrepareWindowConfig::default(),
+        }
+    }
+
+    pub(crate) fn request_urgent_window(
+        &self,
+        song_id: SongId,
+        position: TimelinePosition,
+        transpose_semitones: i32,
+    ) {
+        self.cache.request_prepare(PrepareRequest {
+            song_id,
+            position,
+            transpose_semitones,
+            window_seconds: f64::from(self.window_config.urgent_window_seconds),
+            priority: PreparePriority::RealtimeCritical,
+        });
+    }
+
+    pub(crate) fn request_current_playback_window(
+        &self,
+        song_id: SongId,
+        position: TimelinePosition,
+        transpose_semitones: i32,
+    ) {
+        self.cache.request_prepare(PrepareRequest {
+            song_id,
+            position,
+            transpose_semitones,
+            window_seconds: f64::from(self.window_config.current_ahead_seconds),
+            priority: PreparePriority::CurrentPlayback,
+        });
+    }
+
+    pub(crate) fn queue_len(&self) -> usize {
+        self.cache.prepare_queue_len()
+    }
+}
+
+pub(crate) fn render_transposed_to_cache(
+    raw_source: Arc<dyn PreparedAudioSource>,
+    key: PreparedAudioKey,
+    output_path: PathBuf,
+) -> Result<Arc<dyn PreparedAudioSource>, String> {
+    let channels = raw_source.channels().max(1);
+    let sample_rate = raw_source.sample_rate().max(1);
+    let mut pitch_engine =
+        pitch::create_pitch_shift_engine(sample_rate, channels, key.transpose_semitones);
+    let block_frames = STREAM_WORKER_CHUNK_FRAMES;
+    let mut rendered = Vec::with_capacity(raw_source.frame_count() as usize * channels);
+    let mut source_frame = 0_u64;
+
+    pitch_engine.reset();
+    while source_frame < raw_source.frame_count() {
+        let frames = block_frames.min((raw_source.frame_count() - source_frame) as usize);
+        let mut input = vec![0.0_f32; frames * channels];
+        let frames_read = raw_source.read_interleaved_at(source_frame, &mut input);
+        if frames_read == 0 {
+            break;
+        }
+        input.truncate(frames_read * channels);
+        let mut output = vec![0.0_f32; input.len()];
+        pitch_engine
+            .process_realtime_block(&input, &mut output)
+            .map_err(|error| format!("pitch render failed: {error:?}"))?;
+        rendered.extend_from_slice(&output);
+        source_frame = source_frame.saturating_add(frames_read as u64);
+    }
+
+    write_ltaf_file(&output_path, &rendered, sample_rate, channels)?;
+    let disk_source = Arc::new(RawDiskSource::open_ltaf(&output_path)?);
+    Ok(disk_source)
+}
+
 impl AudioBufferCache {
+    pub(crate) fn prepared_audio(&self) -> PreparedAudioCache {
+        self.prepared_audio.clone()
+    }
+
     #[cfg(test)]
     pub(crate) fn insert_for_test(&self, file_path: PathBuf, source: StreamingAudioSource) {
         self.entries
             .write()
             .expect("audio cache should lock")
             .insert(file_path, Arc::new(source));
+    }
+
+    #[cfg(test)]
+    pub(crate) fn insert_prepared_ram_for_test(
+        &self,
+        key: PreparedAudioKey,
+        source: Arc<dyn PreparedAudioSource>,
+    ) {
+        self.prepared_audio.insert_ready_ram(key, source);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn insert_hot_for_test(
+        &self,
+        file_path: PathBuf,
+        transpose_semitones: i32,
+        source: StreamingAudioSource,
+    ) {
+        self.hot_entries
+            .write()
+            .expect("audio hot cache should lock")
+            .insert(
+                LegacyPreparedAudioKey {
+                    file_path,
+                    transpose_semitones,
+                },
+                Arc::new(source),
+            );
+    }
+
+    #[cfg(test)]
+    pub(crate) fn insert_prepared_disk_for_test(
+        &self,
+        file_path: PathBuf,
+        transpose_semitones: i32,
+        source: StreamingAudioSource,
+    ) {
+        self.prepared_disk_entries
+            .write()
+            .expect("prepared disk cache should lock")
+            .insert(
+                LegacyPreparedAudioKey {
+                    file_path,
+                    transpose_semitones,
+                },
+                Arc::new(source),
+            );
+    }
+
+    #[cfg(test)]
+    pub(crate) fn insert_previous_pitch_for_test(
+        &self,
+        file_path: PathBuf,
+        transpose_semitones: i32,
+        source: StreamingAudioSource,
+    ) {
+        self.previous_pitch_entries
+            .write()
+            .expect("previous pitch cache should lock")
+            .insert(file_path, (transpose_semitones, Arc::new(source)));
     }
 
     pub(crate) fn replace_song_buffers(&self, song_dir: &Path, song: &Song) -> Result<(), String> {
@@ -237,6 +1059,7 @@ impl AudioBufferCache {
             .write()
             .map_err(|_| "audio buffer cache lock poisoned".to_string())?;
         *entries = next_entries;
+        self.rebuild_seek_readiness_map(song_dir, song, 0.0);
 
         Ok(())
     }
@@ -252,6 +1075,251 @@ impl AudioBufferCache {
         Ok(entries.get(file_path).cloned())
     }
 
+    pub(crate) fn get_best_source_for_seek(
+        &self,
+        song_dir: &Path,
+        song: &Song,
+        position: TimelinePosition,
+        required_transpose: i32,
+    ) -> SeekSourceDecision {
+        let Some(plan) = mixer::build_playback_plans(song_dir, song, 48_000)
+            .into_iter()
+            .find(|plan| {
+                let position_frame = seconds_to_frames(position, 48_000);
+                position_frame >= plan.timeline_start_frame
+                    && position_frame < plan.timeline_end_frame()
+            })
+        else {
+            return SeekSourceDecision::Silence;
+        };
+
+        let exact_key = LegacyPreparedAudioKey {
+            file_path: plan.file_path.clone(),
+            transpose_semitones: required_transpose,
+        };
+        if let Ok(hot_entries) = self.hot_entries.try_read() {
+            if let Some(source) = hot_entries.get(&exact_key).cloned() {
+                return SeekSourceDecision::ExactRam(source);
+            }
+        }
+
+        if required_transpose == 0 {
+            if let Ok(entries) = self.entries.try_read() {
+                if let Some(source) = entries.get(&plan.file_path).cloned() {
+                    return SeekSourceDecision::ExactDisk(source);
+                }
+            }
+        }
+        if let Ok(prepared_disk_entries) = self.prepared_disk_entries.try_read() {
+            if let Some(source) = prepared_disk_entries.get(&exact_key).cloned() {
+                return SeekSourceDecision::ExactDisk(source);
+            }
+        }
+
+        let original_key = LegacyPreparedAudioKey {
+            file_path: plan.file_path.clone(),
+            transpose_semitones: 0,
+        };
+        if let Ok(hot_entries) = self.hot_entries.try_read() {
+            if let Some(source) = hot_entries.get(&original_key).cloned() {
+                return SeekSourceDecision::OriginalRam(source);
+            }
+        }
+
+        if let Ok(entries) = self.entries.try_read() {
+            if let Some(source) = entries.get(&plan.file_path).cloned() {
+                return SeekSourceDecision::OriginalDisk(source);
+            }
+        }
+
+        if let Ok(previous_pitch_entries) = self.previous_pitch_entries.try_read() {
+            if let Some((_transpose, source)) = previous_pitch_entries.get(&plan.file_path).cloned()
+            {
+                return SeekSourceDecision::PreviousPitch(source);
+            }
+        }
+
+        SeekSourceDecision::Silence
+    }
+
+    pub(crate) fn record_recent_seek_and_reprioritize(
+        &self,
+        song_dir: &Path,
+        song: &Song,
+        position: TimelinePosition,
+        required_transpose: i32,
+    ) {
+        self.push_prepare_request(PrepareRequest {
+            song_id: song.id.clone(),
+            position,
+            transpose_semitones: required_transpose,
+            window_seconds: 30.0,
+            priority: PreparePriority::RealtimeCritical,
+        });
+        self.rebuild_seek_readiness_map(song_dir, song, position);
+    }
+
+    pub(crate) fn on_timeline_hover_or_drag(
+        &self,
+        song_dir: &Path,
+        song: &Song,
+        position: TimelinePosition,
+    ) {
+        let transpose = transpose_for_position(song, position);
+        self.push_prepare_request(PrepareRequest {
+            song_id: song.id.clone(),
+            position,
+            transpose_semitones: transpose,
+            window_seconds: 5.0,
+            priority: PreparePriority::RealtimeCritical,
+        });
+        self.rebuild_seek_readiness_map(song_dir, song, position);
+    }
+
+    fn rebuild_seek_readiness_map(
+        &self,
+        song_dir: &Path,
+        song: &Song,
+        current_playhead: TimelinePosition,
+    ) {
+        let regions = song
+            .regions
+            .iter()
+            .map(|region| RegionReadinessEntry {
+                region_id: region.id.clone(),
+                start: region.start_seconds,
+                end: region.end_seconds,
+                readiness: self.readiness_at(
+                    song_dir,
+                    song,
+                    region.start_seconds,
+                    region.transpose_semitones,
+                ),
+            })
+            .collect::<Vec<_>>();
+
+        let mut hot_targets = Vec::new();
+        hot_targets.push(SeekTarget {
+            position: current_playhead,
+            kind: SeekTargetKind::CurrentPlayhead,
+            readiness: self.readiness_at(
+                song_dir,
+                song,
+                current_playhead,
+                transpose_for_position(song, current_playhead),
+            ),
+        });
+        for region in &song.regions {
+            hot_targets.push(SeekTarget {
+                position: region.start_seconds,
+                kind: SeekTargetKind::RegionStart,
+                readiness: self.readiness_at(
+                    song_dir,
+                    song,
+                    region.start_seconds,
+                    region.transpose_semitones,
+                ),
+            });
+            hot_targets.push(SeekTarget {
+                position: region.end_seconds,
+                kind: SeekTargetKind::RegionEnd,
+                readiness: self.readiness_at(
+                    song_dir,
+                    song,
+                    region.end_seconds,
+                    region.transpose_semitones,
+                ),
+            });
+        }
+        for marker in &song.section_markers {
+            hot_targets.push(SeekTarget {
+                position: marker.start_seconds,
+                kind: SeekTargetKind::Marker,
+                readiness: self.readiness_at(
+                    song_dir,
+                    song,
+                    marker.start_seconds,
+                    transpose_for_position(song, marker.start_seconds),
+                ),
+            });
+        }
+
+        let mut last_user_positions = self
+            .prepare_requests
+            .read()
+            .ok()
+            .map(|requests| {
+                requests
+                    .iter()
+                    .rev()
+                    .filter(|request| request.song_id == song.id)
+                    .take(10)
+                    .map(|request| request.position)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        last_user_positions.reverse();
+
+        if let Ok(mut maps) = self.seek_readiness_maps.write() {
+            maps.insert(
+                song.id.clone(),
+                SeekReadinessMap {
+                    song_id: song.id.clone(),
+                    hot_targets,
+                    regions,
+                    last_user_positions,
+                },
+            );
+        }
+    }
+
+    fn readiness_at(
+        &self,
+        song_dir: &Path,
+        song: &Song,
+        position: TimelinePosition,
+        required_transpose: i32,
+    ) -> RegionReadiness {
+        match self
+            .get_best_source_for_seek(song_dir, song, position, required_transpose)
+            .kind()
+        {
+            SeekSourceKind::ExactRam => RegionReadiness::ExactRam,
+            SeekSourceKind::ExactDisk => RegionReadiness::ExactDisk,
+            SeekSourceKind::OriginalRam => RegionReadiness::OriginalRam,
+            SeekSourceKind::OriginalDisk => RegionReadiness::OriginalDisk,
+            SeekSourceKind::PreviousPitch | SeekSourceKind::Silence => RegionReadiness::Missing,
+        }
+    }
+
+    fn push_prepare_request(&self, request: PrepareRequest) {
+        if let Ok(mut requests) = self.prepare_requests.write() {
+            requests.push(request);
+            requests.sort_by_key(|request| prepare_priority_rank(request.priority));
+            const MAX_PREPARE_REQUESTS: usize = 256;
+            if requests.len() > MAX_PREPARE_REQUESTS {
+                requests.truncate(MAX_PREPARE_REQUESTS);
+            }
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn prepare_requests_for_test(&self) -> Vec<PrepareRequest> {
+        self.prepare_requests
+            .read()
+            .expect("prepare requests should lock")
+            .clone()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn seek_readiness_map_for_test(&self, song_id: &str) -> Option<SeekReadinessMap> {
+        self.seek_readiness_maps
+            .read()
+            .expect("readiness maps should lock")
+            .get(song_id)
+            .cloned()
+    }
+
     pub(crate) fn stats(&self) -> AudioBufferCacheStats {
         self.entries
             .read()
@@ -259,6 +1327,13 @@ impl AudioBufferCache {
                 cached_buffers: entries.len(),
                 fully_cached_buffers: 0,
                 preload_bytes: entries.values().map(|source| source.preload_bytes()).sum(),
+                prepare_queue_len: self.prepared_audio.prepare_queue_len(),
+                ram_cache_used_mb: self.prepared_audio.ram_cache_used_mb(),
+                disk_cache_used_mb: self
+                    .prepared_disk_entries
+                    .try_read()
+                    .map(|entries| entries.len())
+                    .unwrap_or_default(),
             })
             .unwrap_or_default()
     }
@@ -387,13 +1462,8 @@ impl StreamingClipReader {
 
         let pan = pan.clamp(-1.0, 1.0);
         let (left_input, right_input) = if channels <= 1 {
-            match self.pop_current_sample() {
-                Some(sample) => (sample, sample),
-                None => {
-                    self.declick_frames_remaining = self.declick_fade_frames;
-                    (0.0, 0.0)
-                }
-            }
+            let sample = self.pop_current_sample()?;
+            (sample, sample)
         } else {
             match (self.pop_current_sample(), self.pop_current_sample()) {
                 (Some(left), Some(right)) => {
@@ -402,10 +1472,7 @@ impl StreamingClipReader {
                     }
                     (left, right)
                 }
-                _ => {
-                    self.declick_frames_remaining = self.declick_fade_frames;
-                    (0.0, 0.0)
-                }
+                _ => return None,
             }
         };
 
@@ -492,6 +1559,10 @@ impl StreamingClipReader {
 
         (left_peak, right_peak)
     }
+
+    pub(crate) fn suppress_initial_declick(&mut self) {
+        self.declick_frames_remaining = 0;
+    }
 }
 
 impl Drop for StreamingClipReader {
@@ -575,11 +1646,11 @@ fn stream_decode_from(
     let pitch_preroll_frames = pitch_engine
         .latency_frames()
         .saturating_sub(PITCH_ALIGNMENT_TRIM_FRAMES);
-    let mut decoder =
-        match StreamingDecoder::open(source, output_sample_rate, target_start_seconds) {
-            Ok(decoder) => decoder,
-            Err(_) => return WorkerOutcome::Finished,
-        };
+    let mut decoder = match StreamingDecoder::open(source, output_sample_rate, target_start_seconds)
+    {
+        Ok(decoder) => decoder,
+        Err(_) => return WorkerOutcome::Finished,
+    };
     pitch_engine.reset();
     let channels = source.channels.max(1);
     let mut pending_samples = Vec::new();
@@ -956,6 +2027,66 @@ fn source_frame_for_timeline_position(
     ) as usize
 }
 
+fn transpose_for_position(song: &Song, position_seconds: f64) -> i32 {
+    song.regions
+        .iter()
+        .find(|region| {
+            position_seconds >= region.start_seconds && position_seconds < region.end_seconds
+        })
+        .map(|region| region.transpose_semitones)
+        .unwrap_or(0)
+}
+
+#[cfg(windows)]
+fn file_read_at(file: &File, buffer: &mut [u8], offset: u64) -> std::io::Result<usize> {
+    file.seek_read(buffer, offset)
+}
+
+#[cfg(unix)]
+fn file_read_at(file: &File, buffer: &mut [u8], offset: u64) -> std::io::Result<usize> {
+    file.read_at(buffer, offset)
+}
+
+fn write_ltaf_file(
+    path: &Path,
+    samples: &[f32],
+    sample_rate: u32,
+    channels: usize,
+) -> Result<(), String> {
+    let channels = channels.max(1);
+    let frame_count = (samples.len() / channels) as u64;
+    let mut header = [0_u8; LTAF_HEADER_LEN as usize];
+    header[0..4].copy_from_slice(LTAF_MAGIC);
+    header[4..8].copy_from_slice(&LTAF_VERSION.to_le_bytes());
+    header[8..12].copy_from_slice(&sample_rate.max(1).to_le_bytes());
+    header[12..16].copy_from_slice(&(channels as u32).to_le_bytes());
+    header[16..24].copy_from_slice(&frame_count.to_le_bytes());
+    header[24..28].copy_from_slice(&0_i32.to_le_bytes());
+    header[28] = 1;
+
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+    }
+    let mut file = File::create(path).map_err(|error| error.to_string())?;
+    file.write_all(&header).map_err(|error| error.to_string())?;
+    for &sample in samples {
+        file.write_all(&sample.to_le_bytes())
+            .map_err(|error| error.to_string())?;
+    }
+    file.flush().map_err(|error| error.to_string())
+}
+
+fn prepare_priority_rank(priority: PreparePriority) -> u8 {
+    match priority {
+        PreparePriority::RealtimeCritical => 0,
+        PreparePriority::CurrentPlayback => 1,
+        PreparePriority::HotSeekTarget => 2,
+        PreparePriority::CurrentSong => 3,
+        PreparePriority::NextSong => 4,
+        PreparePriority::Background => 5,
+    }
+}
+
 pub(crate) fn resolve_clip_audio_path(song_dir: &Path, file_path: &str) -> PathBuf {
     let path = Path::new(file_path);
     if path.is_absolute() {
@@ -1008,11 +2139,8 @@ pub(crate) fn render_plan_frames_for_test(
     );
     let target_start_seconds =
         source_start_frame as f64 / f64::from(shared_source.sample_rate.max(1));
-    let mut pitch_engine = pitch::create_pitch_shift_engine(
-        output_sample_rate,
-        channels,
-        plan.transpose_semitones,
-    );
+    let mut pitch_engine =
+        pitch::create_pitch_shift_engine(output_sample_rate, channels, plan.transpose_semitones);
 
     render_pitch_aligned_frames_for_test(
         &shared_source,
@@ -1044,8 +2172,13 @@ fn render_pitch_aligned_frames_for_test(
         let mut remaining_priming = pitch_preroll_frames;
         while remaining_priming > 0 {
             let chunk_frames = remaining_priming.min(STREAM_WORKER_CHUNK_FRAMES);
-            let mut input =
-                take_decoder_samples(&mut decoder, &mut pending_samples, chunk_frames, channels, true)?;
+            let mut input = take_decoder_samples(
+                &mut decoder,
+                &mut pending_samples,
+                chunk_frames,
+                channels,
+                true,
+            )?;
             if input.is_empty() {
                 input.resize(chunk_frames * channels, 0.0);
             }
@@ -1062,8 +2195,13 @@ fn render_pitch_aligned_frames_for_test(
     while rendered.len() < wanted_samples {
         let remaining_frames = (wanted_samples - rendered.len()).div_ceil(channels);
         let chunk_frames = remaining_frames.min(STREAM_WORKER_CHUNK_FRAMES).max(1);
-        let samples =
-            take_decoder_samples(&mut decoder, &mut pending_samples, chunk_frames, channels, false)?;
+        let samples = take_decoder_samples(
+            &mut decoder,
+            &mut pending_samples,
+            chunk_frames,
+            channels,
+            false,
+        )?;
         let input = if samples.is_empty() {
             vec![0.0_f32; chunk_frames * channels]
         } else {
@@ -1160,7 +2298,9 @@ mod tests {
         const ENVELOPE_RADIUS: usize = 32;
 
         let start = center.saturating_sub(radius + max_shift);
-        let end = (center + radius + max_shift + 1).min(left.len()).min(right.len());
+        let end = (center + radius + max_shift + 1)
+            .min(left.len())
+            .min(right.len());
         let smooth_envelope = |window: &[f32]| {
             (0..window.len())
                 .map(|index| {
@@ -1273,6 +2413,230 @@ mod tests {
     }
 
     #[test]
+    fn streaming_clip_reader_starvation_returns_none_without_restarting_declick() {
+        let (_producer, consumer) = RingBuffer::<ClipSample>::new(4);
+        let (command_sender, _command_receiver) = mpsc::channel();
+        let mut reader = StreamingClipReader {
+            shared_source: Arc::new(StreamingAudioSource::from_preloaded(
+                vec![0.0],
+                48_000,
+                1,
+                false,
+            )),
+            consumer,
+            command_sender,
+            output_sample_rate: 48_000,
+            current_generation: 0,
+            current_source_start_frame: 0,
+            emitted_frames: 0,
+            total_output_frames: 16,
+            declick_fade_frames: 8,
+            declick_frames_remaining: 3,
+            eof: false,
+        };
+
+        assert_eq!(reader.next_stereo_frame(1.0, 0.0), None);
+        assert_eq!(reader.declick_frames_remaining, 3);
+        assert!(!reader.eof);
+    }
+
+    #[test]
+    fn raw_ram_source_reads_interleaved_frames_by_absolute_frame() {
+        let source = RawRamSource::new(vec![0.1, 0.2, 0.3, 0.4, 0.5, 0.6], 48_000, 2);
+        let mut output = [0.0_f32; 4];
+
+        let frames = source.read_interleaved_at(1, &mut output);
+
+        assert_eq!(frames, 2);
+        assert_eq!(output, [0.3, 0.4, 0.5, 0.6]);
+        assert_eq!(source.frame_count(), 3);
+    }
+
+    #[test]
+    fn raw_ram_source_out_of_range_returns_zero_frames_without_panic() {
+        let source = RawRamSource::new(vec![0.1, 0.2], 48_000, 1);
+        let mut output = [1.0_f32; 2];
+
+        let frames = source.read_interleaved_at(8, &mut output);
+
+        assert_eq!(frames, 0);
+        assert_eq!(output, [1.0, 1.0]);
+    }
+
+    #[test]
+    fn raw_disk_source_reads_ltaf_random_access() {
+        let temp_dir = tempfile::tempdir().expect("temp dir should exist");
+        let path = temp_dir.path().join("cache/audio-renders/source.ltaf");
+        RawDiskSource::write_ltaf_for_test(&path, &[0.1, 0.2, 0.3, 0.4, 0.5, 0.6], 48_000, 2)
+            .expect("LTAF should write");
+        let source = RawDiskSource::open_ltaf(&path).expect("LTAF should open");
+        let mut output = [0.0_f32; 4];
+
+        let frames = source.read_interleaved_at(1, &mut output);
+
+        assert_eq!(frames, 2);
+        assert_eq!(output, [0.3, 0.4, 0.5, 0.6]);
+        assert_eq!(source.sample_rate(), 48_000);
+        assert_eq!(source.channels(), 2);
+        assert_eq!(source.frame_count(), 3);
+    }
+
+    #[test]
+    fn prepared_audio_cache_prefers_exact_over_original_and_silence() {
+        let cache = PreparedAudioCache::default();
+        let exact_key = PreparedAudioKey {
+            file_id: "file-a".into(),
+            file_hash: "hash-a".into(),
+            sample_rate: 48_000,
+            channels: 1,
+            transpose_semitones: 2,
+        };
+        let original_key = PreparedAudioKey {
+            transpose_semitones: 0,
+            ..exact_key.clone()
+        };
+        cache.insert_ready_ram(
+            original_key,
+            Arc::new(RawRamSource::new(vec![0.1, 0.2, 0.3], 48_000, 1)),
+        );
+
+        let fallback = cache.get_best_available(&exact_key, 1);
+        assert_eq!(fallback.kind(), SeekSourceKind::OriginalRam);
+
+        cache.insert_ready_ram(
+            exact_key.clone(),
+            Arc::new(TransposedRamSource::new(vec![0.4, 0.5, 0.6], 48_000, 1)),
+        );
+        let exact = cache.get_best_available(&exact_key, 1);
+
+        assert_eq!(exact.kind(), SeekSourceKind::ExactRam);
+    }
+
+    #[test]
+    fn prepared_audio_cache_get_best_available_is_non_blocking_on_locked_state() {
+        let cache = PreparedAudioCache::default();
+        let key = PreparedAudioKey {
+            file_id: "file-a".into(),
+            file_hash: "hash-a".into(),
+            sample_rate: 48_000,
+            channels: 1,
+            transpose_semitones: 3,
+        };
+        let _held_lock = cache.states.write().expect("state lock should hold");
+        let started_at = Instant::now();
+
+        let decision = cache.get_best_available(&key, 0);
+
+        assert_eq!(decision.kind(), SeekSourceKind::Silence);
+        assert!(started_at.elapsed() < Duration::from_millis(10));
+    }
+
+    #[test]
+    fn prepared_audio_cache_previous_pitch_fallback_works() {
+        let cache = PreparedAudioCache::default();
+        let old_pitch_key = PreparedAudioKey {
+            file_id: "file-a".into(),
+            file_hash: "hash-a".into(),
+            sample_rate: 48_000,
+            channels: 1,
+            transpose_semitones: 1,
+        };
+        let requested_key = PreparedAudioKey {
+            transpose_semitones: 4,
+            ..old_pitch_key.clone()
+        };
+        cache.insert_ready_ram(
+            old_pitch_key,
+            Arc::new(TransposedRamSource::new(vec![0.1, 0.2], 48_000, 1)),
+        );
+
+        let decision = cache.get_best_available(&requested_key, 0);
+
+        assert_eq!(decision.kind(), SeekSourceKind::PreviousPitch);
+    }
+
+    #[test]
+    fn render_transposed_to_cache_writes_ltaf_off_playback_path() {
+        let temp_dir = tempfile::tempdir().expect("temp dir should exist");
+        let output_path = temp_dir.path().join("audio-renders/transposed.ltaf");
+        let raw: Arc<dyn PreparedAudioSource> =
+            Arc::new(RawRamSource::new(vec![0.1; 1_024], 48_000, 1));
+        let key = PreparedAudioKey {
+            file_id: "file-a".into(),
+            file_hash: "hash-a".into(),
+            sample_rate: 48_000,
+            channels: 1,
+            transpose_semitones: 2,
+        };
+
+        let rendered = render_transposed_to_cache(raw, key, output_path)
+            .expect("transpose render should work");
+        let mut output = vec![0.0_f32; 64];
+        let frames = rendered.read_interleaved_at(0, &mut output);
+
+        assert!(frames > 0);
+        assert_eq!(rendered.channels(), 1);
+    }
+
+    #[test]
+    fn prepare_manager_orders_realtime_critical_before_playback() {
+        let cache = PreparedAudioCache::default();
+        let manager = AudioPrepareManager::new(cache.clone());
+
+        manager.request_current_playback_window("song".into(), 1.0, 0);
+        manager.request_urgent_window("song".into(), 8.0, 2);
+
+        let queue = cache
+            .prepare_queue
+            .read()
+            .expect("prepare queue should lock");
+        assert_eq!(manager.queue_len(), 2);
+        assert_eq!(queue[0].priority, PreparePriority::RealtimeCritical);
+        assert_eq!(queue[1].priority, PreparePriority::CurrentPlayback);
+    }
+
+    #[test]
+    fn ram_hot_cache_evicts_low_priority_before_current_windows() {
+        let cache = PreparedAudioCache {
+            ram_config: RamCacheConfig {
+                max_mb: 1,
+                min_free_system_mb: 0,
+                window_seconds: 5.0,
+            },
+            ..PreparedAudioCache::default()
+        };
+        let key = PreparedAudioKey {
+            file_id: "file".into(),
+            file_hash: "hash".into(),
+            sample_rate: 48_000,
+            channels: 1,
+            transpose_semitones: 0,
+        };
+        cache.insert_ram_window(
+            PreparedWindowKey {
+                audio_key: key.clone(),
+                start_frame: 0,
+                end_frame: 10,
+            },
+            900 * 1024,
+            95,
+        );
+        cache.insert_ram_window(
+            PreparedWindowKey {
+                audio_key: key,
+                start_frame: 10,
+                end_frame: 20,
+            },
+            900 * 1024,
+            20,
+        );
+
+        let windows = cache.ram_windows.read().expect("ram windows should lock");
+        assert_eq!(windows.len(), 1);
+        assert!(windows.values().all(|entry| entry.priority_weight >= 90));
+    }
+
+    #[test]
     fn streaming_clip_reader_transposed_start_is_not_latency_delayed() {
         let sample_rate = 48_000;
         let interval_frames = sample_rate as usize;
@@ -1285,9 +2649,8 @@ mod tests {
             let phase = frame % interval_frames;
             let sample = if phase < click_frames {
                 let envelope = 1.0 - (phase as f32 / click_frames.max(1) as f32);
-                let radians =
-                    2.0 * std::f32::consts::PI * click_frequency_hz * phase as f32
-                        / sample_rate as f32;
+                let radians = 2.0 * std::f32::consts::PI * click_frequency_hz * phase as f32
+                    / sample_rate as f32;
                 radians.cos() * envelope
             } else {
                 0.0
@@ -1325,15 +2688,12 @@ mod tests {
             transpose_semitones: 2,
         };
 
-        let mut bypass_reader = StreamingClipReader::open(&bypass_plan, sample_rate, &audio_buffers, 0)
-            .expect("bypass reader should open");
-        let mut transposed_reader = StreamingClipReader::open(
-            &transposed_plan,
-            sample_rate,
-            &audio_buffers,
-            0,
-        )
-        .expect("transposed reader should open");
+        let mut bypass_reader =
+            StreamingClipReader::open(&bypass_plan, sample_rate, &audio_buffers, 0)
+                .expect("bypass reader should open");
+        let mut transposed_reader =
+            StreamingClipReader::open(&transposed_plan, sample_rate, &audio_buffers, 0)
+                .expect("transposed reader should open");
 
         let mut bypass_mix = vec![0.0_f32; 4_096];
         let mut transposed_mix = vec![0.0_f32; 4_096];
@@ -1342,10 +2702,7 @@ mod tests {
 
         let offset = best_envelope_alignment_offset(&bypass_mix, &transposed_mix, 0, 2_048, 64);
 
-        assert!(
-            offset <= 3,
-            "startup offset too large: offset={offset}"
-        );
+        assert!(offset <= 3, "startup offset too large: offset={offset}");
     }
 
     #[test]
@@ -1361,9 +2718,8 @@ mod tests {
             let phase = frame % interval_frames;
             let sample = if phase < click_frames {
                 let envelope = 1.0 - (phase as f32 / click_frames.max(1) as f32);
-                let radians =
-                    2.0 * std::f32::consts::PI * click_frequency_hz * phase as f32
-                        / sample_rate as f32;
+                let radians = 2.0 * std::f32::consts::PI * click_frequency_hz * phase as f32
+                    / sample_rate as f32;
                 radians.cos() * envelope
             } else {
                 0.0
@@ -1401,15 +2757,12 @@ mod tests {
             transpose_semitones: 2,
         };
 
-        let mut bypass_reader = StreamingClipReader::open(&bypass_plan, sample_rate, &audio_buffers, 0)
-            .expect("bypass reader should open");
-        let mut transposed_reader = StreamingClipReader::open(
-            &transposed_plan,
-            sample_rate,
-            &audio_buffers,
-            0,
-        )
-        .expect("transposed reader should open");
+        let mut bypass_reader =
+            StreamingClipReader::open(&bypass_plan, sample_rate, &audio_buffers, 0)
+                .expect("bypass reader should open");
+        let mut transposed_reader =
+            StreamingClipReader::open(&transposed_plan, sample_rate, &audio_buffers, 0)
+                .expect("transposed reader should open");
 
         let seek_frame = sample_rate as usize * 10;
         bypass_reader.seek_to(seek_frame);
@@ -1422,9 +2775,6 @@ mod tests {
 
         let offset = best_envelope_alignment_offset(&bypass_mix, &transposed_mix, 0, 2_048, 64);
 
-        assert!(
-            offset <= 3,
-            "seek offset too large: offset={offset}"
-        );
+        assert!(offset <= 3, "seek offset too large: offset={offset}");
     }
 }

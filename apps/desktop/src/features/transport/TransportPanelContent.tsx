@@ -87,6 +87,7 @@ import {
   pauseTransport,
   pickAndImportSong,
   playTransport,
+  prewarmTimelineSeek,
   redoAction,
   renameLibraryFolder,
   reportUiRenderMetric,
@@ -3344,6 +3345,10 @@ export function TransportPanelContent() {
       restoreConfirmedTransportVisual();
       throw error;
     }
+  }
+
+  function prewarmTimelinePosition(positionSeconds: number) {
+    void prewarmTimelineSeek(positionSeconds).catch(() => undefined);
   }
 
   function normalizeTimelineSeekSeconds(
@@ -6936,6 +6941,7 @@ export function TransportPanelContent() {
                 normalizePositionSeconds={(positionSeconds) =>
                   normalizeTimelineSeekSeconds(positionSeconds, workspaceDurationSeconds)}
                 resolveLibraryGhostLeft={resolveLibraryGhostLeft}
+                onSeekIntent={prewarmTimelinePosition}
                 onRulerMouseDown={(event) => {
                   if (!song || event.button !== 0 || !rulerTrackRef.current) {
                     return;
@@ -6943,6 +6949,7 @@ export function TransportPanelContent() {
 
                   event.preventDefault();
                   const seekStartSeconds = snappedRulerSeconds(event, workspaceDurationSeconds);
+                  prewarmTimelinePosition(seekStartSeconds);
                   const startSeconds = snappedRulerSeconds(event, workspaceDurationSeconds);
                   clearSelection();
                   setSelectedRegionId(null);
@@ -7022,6 +7029,7 @@ export function TransportPanelContent() {
 
                     hasMoved = true;
                     latestClientX = windowEvent.clientX;
+                    prewarmTimelinePosition(snappedRulerSecondsAtClientX(windowEvent.clientX, workspaceDurationSeconds));
                     updateRangeSelection(windowEvent.clientX);
                     updateRangeAutoScroll(windowEvent.clientX);
                   };

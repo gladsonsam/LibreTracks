@@ -152,7 +152,7 @@ function formatClipSignatureNumber(value: number | null | undefined) {
   return (typeof value === "number" && Number.isFinite(value) ? value : 0).toFixed(6);
 }
 
-function buildClipSceneSignature(clipsByTrack: Record<string, ClipSummary[]>) {
+function buildClipSceneSignature(clipsByTrack: Record<string, TimelineClipSummary[]>) {
   return Object.keys(clipsByTrack)
     .sort()
     .map((trackId) =>

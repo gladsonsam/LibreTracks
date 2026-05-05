@@ -237,19 +237,13 @@ async fn run_remote_command_bridge(
             RemoteCommand::UpdateRegionTranspose {
                 region_id,
                 transpose_semitones,
-            } => session.update_song_region_transpose(
-                region_id,
-                *transpose_semitones,
-                &state.audio,
-            ),
+            } => {
+                session.update_song_region_transpose(region_id, *transpose_semitones, &state.audio)
+            }
             RemoteCommand::UpdateTrackTransposeEnabled {
                 track_id,
                 transpose_enabled,
-            } => session.update_track_transpose_enabled(
-                track_id,
-                *transpose_enabled,
-                &state.audio,
-            ),
+            } => session.update_track_transpose_enabled(track_id, *transpose_enabled, &state.audio),
             RemoteCommand::UpdateMetronome { enabled, volume } => {
                 let settings_store = app.state::<AppSettingsStore>();
                 let mut next_settings = match settings_store.current() {

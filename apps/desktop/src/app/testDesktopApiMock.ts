@@ -898,6 +898,7 @@ export const testDesktopApiMock = {
     state.playbackPositionSeconds = Math.max(0, positionSeconds);
     return clone(buildSnapshot());
   },
+  prewarmTimelineSeek: async (_positionSeconds: number) => {},
   toggleVamp: async (mode: "section" | "bars", bars?: number) => {
     if (state.activeVamp) {
       state.activeVamp = null;

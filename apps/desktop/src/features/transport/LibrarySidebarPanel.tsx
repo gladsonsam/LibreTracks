@@ -115,7 +115,7 @@ export function LibrarySidebarPanel({
     [assets],
   );
   const folderGroups = useMemo(() => {
-    const assetsByFolder = new Map<string, LibraryAssetSummary[]>();
+    const assetsByFolder = new Map<string, PendingLibraryAssetSummary[]>();
 
     for (const folderPath of folders) {
       assetsByFolder.set(folderPath, []);
@@ -224,7 +224,7 @@ export function LibrarySidebarPanel({
     ];
   };
 
-  const handleAssetKeyDown = (event: KeyboardEvent<HTMLDivElement>, asset: LibraryAssetSummary) => {
+  const handleAssetKeyDown = (event: KeyboardEvent<HTMLDivElement>, asset: PendingLibraryAssetSummary) => {
     if (event.key === "Delete" && selectedAssets.length > 0) {
       event.preventDefault();
       onDeleteRequested(selectedAssets);

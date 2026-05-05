@@ -184,11 +184,15 @@ pub async fn import_audio_files_from_bytes(
     };
 
     tauri::async_runtime::spawn_blocking(move || {
-        crate::state::import_audio_files_from_bytes_to_library(&song_dir, current_song.as_ref(), &files)
+        crate::state::import_audio_files_from_bytes_to_library(
+            &song_dir,
+            current_song.as_ref(),
+            &files,
+        )
     })
     .await
     .map_err(|error| error.to_string())?
-        .map_err(|error| error.to_string())
+    .map_err(|error| error.to_string())
 }
 
 #[tauri::command]
@@ -210,11 +214,15 @@ pub async fn import_audio_files_from_paths(
     };
 
     tauri::async_runtime::spawn_blocking(move || {
-        crate::state::import_audio_files_from_paths_to_library(&song_dir, current_song.as_ref(), &files)
+        crate::state::import_audio_files_from_paths_to_library(
+            &song_dir,
+            current_song.as_ref(),
+            &files,
+        )
     })
     .await
     .map_err(|error| error.to_string())?
-        .map_err(|error| error.to_string())
+    .map_err(|error| error.to_string())
 }
 
 #[tauri::command]

@@ -108,6 +108,7 @@ type TimelineCanvasPaneProps = {
   onNativeZoomCommit: (view: { cameraX: number; zoomLevel: number }) => void;
   onNativeTrackHeightChange: (trackHeight: number) => void;
   onPreviewPositionChange: (positionSeconds: number) => void;
+  onSeekIntent: (positionSeconds: number) => void;
   onPlayheadSeekCommit: (positionSeconds: number) => void;
   onTrackListContextMenu: (event: ReactMouseEvent<HTMLDivElement>) => void;
   onTrackLaneMouseDown: (
@@ -184,6 +185,7 @@ export function TimelineCanvasPane({
   onNativeZoomCommit,
   onNativeTrackHeightChange,
   onPreviewPositionChange,
+  onSeekIntent,
   onPlayheadSeekCommit,
   onTrackListContextMenu,
   onTrackLaneMouseDown,
@@ -483,6 +485,7 @@ export function TimelineCanvasPane({
             positionBoundsRef={rulerTrackRef}
             scrollContainerRef={horizontalScrollbarRef}
             onPreviewPositionChange={onPreviewPositionChange}
+            onSeekIntent={onSeekIntent}
             onSeekCommit={onPlayheadSeekCommit}
           />
         </div>
